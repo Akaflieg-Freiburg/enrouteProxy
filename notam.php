@@ -75,13 +75,13 @@ if (!isset($_GET['locationLongitude'])) die('No longitude specified'); //FB
 $longitude = $_GET['locationLongitude'];
 if (!isValidLatitude($longitude)) die ('Invalid longitude string!');
 
-if (!isset($_GET['locationLatitude']))  die('No latitude specified'); //FB
+if (!isset($_GET['locationLatitude'])) die('No latitude specified'); //FB
 $latitude = $_GET['locationLatitude'];
 if (!isValidLatitude($latitude)) die ('Invalid latitude string!');
 
-if (!isset($_GET['locationRadius']))    die('No search radius specified'); //FB
+if (!isset($_GET['locationRadius'])) die('No search radius specified'); //FB
 $radius = $_GET['locationRadius'];
-if (!isValidLatitude($radius)) die ('Invalid radius string!');
+if (!isValidRadius($radius)) die ('Invalid radius string!');
 
 
 //
