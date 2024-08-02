@@ -1,4 +1,6 @@
 <?php
+header("Content-Type: application/json");
+
 // Dieses Skript liest NOTAMs über eine für maschinelle Anfragen 
 // vorgesehene Schnittstelle der Federal Aviation Administration (FAA)
 // der USA ein und gibt sie aus.
@@ -62,62 +64,52 @@ function isValidPageSize($input) {
 }
 
 
+try {
+    // Input validation and sanitization
+    $longitude = filter_input(INPUT_GET, 'locationLongitude', FILTER_VALIDATE_FLOAT);
+    $latitude = filter_input(INPUT_GET, 'locationLatitude', FILTER_VALIDATE_FLOAT);
+    $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_INT);
+    $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
+
+    if (!$longitude || !$latitude || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
+      throw new InvalidArgumentException("Invalid input parameters");
+    }
 
 
-//
-// Get parameters and check for validity
-//
+    // Build request
+    $url = 'https://external-api.faa.gov/notamapi/v1/notams?'
+    . 'locationLongitude=' . $longitude
+    . '&locationLatitude=' . $latitude
+    . '&locationRadius=' . $radius
+    . '&pageSize=' . $pageSize;
 
-$pageSize = isset($_GET['pageSize']) ? $_GET['pageSize'] : 1000;
-if (!isValidPageSize($pageSize)) die ('Invalid pageSize string!');
+    $FAA_KEY = getenv('FAA_KEY');
+    $FAA_ID  = getenv('FAA_ID');
 
-if (!isset($_GET['locationLongitude'])) die('No longitude specified'); //FB
-$longitude = $_GET['locationLongitude'];
-if (!isValidLatitude($longitude)) die ('Invalid longitude string!');
-
-if (!isset($_GET['locationLatitude'])) die('No latitude specified'); //FB
-$latitude = $_GET['locationLatitude'];
-if (!isValidLatitude($latitude)) die ('Invalid latitude string!');
-
-if (!isset($_GET['locationRadius'])) die('No search radius specified'); //FB
-$radius = $_GET['locationRadius'];
-if (!isValidRadius($radius)) die ('Invalid radius string!');
+    $opts = array(
+        'http' => array(
+            'header' => "client_id: $FAA_ID\r\n" .
+                        "client_secret: $FAA_KEY\r\n"
+        )
+    );
 
 
-//
-// Build request
-//
+    // Get data
+    $context = stream_context_create($opts);
+    $response = file_get_contents($url, false, $context);
 
-$url = 'https://external-api.faa.gov/notamapi/v1/notams?'
-  . 'locationLongitude=' . $longitude
-  . '&locationLatitude=' . $latitude
-  . '&locationRadius=' . $radius
-  . '&pageSize=' . $pageSize;
+    if ($response === false) {
+        throw new Exception("Failed to get NOTAM data from FAA API");
+    }
 
-$FAA_KEY = getenv('FAA_KEY');
-$FAA_ID  = getenv('FAA_ID');
+    // Return data
+    echo $response;
 
-$opts = array(
-	'http' => array(
-		'header' => "client_id: $FAA_ID\r\n" .
-		      	    "client_secret: $FAA_KEY\r\n"
-	)
-);
-
-
-//
-// Get data
-//
-
-$context = stream_context_create($opts);
-$response = file_get_contents($url, false, $context);
-
-
-//
-// Return data
-//
-
-echo $response;
-unset($pageSize, $url, $opts, $context, $response);
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(["error" => $e->getMessage()]);
+    // Log the error
+    error_log($e->getMessage());
+}
 
 ?>
