@@ -40,6 +40,15 @@ function getDbConnection() {
     }
 }
 
+// Log cache metrics
+function logCacheMetrics($pdo, $isHit) {
+    $metric = $isHit ? 'hit' : 'miss';
+    $stmt = $pdo->prepare("INSERT INTO cache_metrics (metric, count, date) 
+                           VALUES (?, 1, CURDATE())
+                           ON DUPLICATE KEY UPDATE count = count + 1");
+    $stmt->execute([$metric]);
+}
+
 // Function to get cached data or fetch from API
 function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
     // Generate a unique cache key based on the URL
@@ -52,8 +61,11 @@ function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
 
     if ($result) {
         // Data found in cache
+        logCacheMetrics($pdo, true); // Cache hit
         return $result['cache_value'];
     }
+
+    logCacheMetrics($pdo, false); // Cache miss
 
     // If not in cache or expired, fetch from API
     $context = stream_context_create($opts);
