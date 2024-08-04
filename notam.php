@@ -41,7 +41,7 @@ function getDbConnection() {
 }
 
 // Function to get cached data or fetch from API
-function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 300) {
+function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
     // Generate a unique cache key based on the URL
     $cacheKey = 'notam_' . md5($url);
 
