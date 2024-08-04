@@ -21,7 +21,7 @@ header("Content-Type: application/json");
 
 // Function to get database connection
 function getDbConnection() {
-    $host = 'sql731.your-server.delocalhost';
+    $host = 'sql731.your-server.de';
     $db   = 'enroutecaches';
     $user = getenv('DB_USER');
     $pass = getenv('DB_PASS');
