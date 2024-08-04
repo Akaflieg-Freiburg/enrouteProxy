@@ -19,6 +19,61 @@ header("Content-Type: application/json");
 // Das Anhängen von &pageSize=d mit d als gewünschter Zahl ist optional; 
 // ohne Nennung wird 1000 als Default gesetzt.
 
+// Function to get database connection
+function getDbConnection() {
+    $host = 'sql731.your-server.delocalhost';
+    $db   = 'enroutecaches';
+    $user = getenv('DB_USER');
+    $pass = getenv('DB_PASS');
+    $charset = 'utf8mb4';
+
+    $dsn = "mysql:host=$host;dbname=$db;charset=$charset";
+    $options = [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ];
+    try {
+        return new PDO($dsn, $user, $pass, $options);
+    } catch (\PDOException $e) {
+        throw new \PDOException($e->getMessage(), (int)$e->getCode());
+    }
+}
+
+// Function to get cached data or fetch from API
+function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 300) {
+    // Generate a unique cache key based on the URL
+    $cacheKey = 'notam_' . md5($url);
+
+    // Try to fetch from cache
+    $stmt = $pdo->prepare("SELECT cache_value FROM notam_cache WHERE cache_key = ? AND expiration > NOW()");
+    $stmt->execute([$cacheKey]);
+    $result = $stmt->fetch();
+
+    if ($result) {
+        // Data found in cache
+        return $result['cache_value'];
+    }
+
+    // If not in cache or expired, fetch from API
+    $context = stream_context_create($opts);
+    $response = file_get_contents($url, false, $context);
+
+    if ($response === false) {
+        throw new Exception("Failed to get data from FAA API");
+    }
+
+    // Store in cache
+    $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
+                           VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))
+                           ON DUPLICATE KEY UPDATE 
+                           cache_value = VALUES(cache_value), 
+                           expiration = VALUES(expiration)");
+    $stmt->execute([$cacheKey, $response, $cacheTime]);
+
+    return $response;
+}
+
 function isValidLatitude($input) {
     // Define the regular expression pattern for latitude and longitude
     $pattern = '/^(-?\d+(\.\d+)?)$/';
@@ -65,6 +120,8 @@ function isValidPageSize($input) {
 
 
 try {
+    $pdo = getDbConnection();
+
     // Input validation and sanitization
     $longitude = filter_input(INPUT_GET, 'locationLongitude', FILTER_VALIDATE_FLOAT);
     $latitude = filter_input(INPUT_GET, 'locationLatitude', FILTER_VALIDATE_FLOAT);
@@ -93,16 +150,14 @@ try {
         )
     );
 
-
-    // Get data
-    $context = stream_context_create($opts);
-    $response = file_get_contents($url, false, $context);
-
+    // Get data (cached or fresh)
+    $response = getCachedOrFreshData($pdo, $url, $opts);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
 
     // Return data
+    header('Content-Type: application/json');
     echo $response;
 
 } catch (Exception $e) {
