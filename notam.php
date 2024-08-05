@@ -40,6 +40,28 @@ function getDbConnection() {
     }
 }
 
+// Function to clean up old cache entries and aggregate metrics
+function performMaintenance($pdo) {
+    // Delete expired cache entries
+    $stmt = $pdo->prepare("DELETE FROM notam_cache WHERE expiration < NOW()");
+    $stmt->execute();
+
+    // Aggregate metrics older than 30 days
+    $stmt = $pdo->prepare("
+        INSERT INTO cache_metrics_monthly (year, month, metric, count)
+        SELECT YEAR(date), MONTH(date), metric, SUM(count)
+        FROM cache_metrics
+        WHERE date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        GROUP BY YEAR(date), MONTH(date), metric
+        ON DUPLICATE KEY UPDATE count = count + VALUES(count)
+    ");
+    $stmt->execute();
+
+    // Delete aggregated daily metrics
+    $stmt = $pdo->prepare("DELETE FROM cache_metrics WHERE date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)");
+    $stmt->execute();
+}
+
 // Log cache metrics
 function logCacheMetrics($pdo, $isHit) {
     $metric = $isHit ? 'hit' : 'miss';
@@ -47,6 +69,11 @@ function logCacheMetrics($pdo, $isHit) {
                            VALUES (?, 1, CURDATE())
                            ON DUPLICATE KEY UPDATE count = count + 1");
     $stmt->execute([$metric]);
+
+    // Perform maintenance operations occasionally (e.g., 1% of the time)
+    if (rand(1, 100) == 1) {
+        performMaintenance($pdo);
+    }
 }
 
 // Function to get cached data or fetch from API
