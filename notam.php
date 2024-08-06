@@ -96,10 +96,22 @@ function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
 
     // If not in cache or expired, fetch from API
     $context = stream_context_create($opts);
-    $response = file_get_contents($url, false, $context);
+    $response = @file_get_contents($url, false, $context);
 
-    if ($response === false) {
-        throw new Exception("Failed to get data from FAA API");
+    // Get the status code
+    $status_code = 0;
+    if (isset($http_response_header[0])) {
+        preg_match('/\d{3}/', $http_response_header[0], $matches);
+        $status_code = intval($matches[0]);
+    }
+    if ($response === false || $status_code < 200 || $status_code >= 300) {
+        $error_message = "Failed to get data from FAA API. Status code: $status_code";
+        if ($status_code >= 500) {
+            error_log("Server error when accessing FAA API: $status_code");
+        } elseif ($status_code == 404) {
+            error_log("Resource not found on FAA API: $url");
+        }
+        throw new Exception($error_message);
     }
 
     // Store in cache
