@@ -77,7 +77,7 @@ function logCacheMetrics($pdo, $isHit) {
 }
 
 // Function to get cached data or fetch from API
-function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
+function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     // Generate a unique cache key based on the URL
     $cacheKey = 'notam_' . md5($url);
 
@@ -95,16 +95,8 @@ function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
     logCacheMetrics($pdo, false); // Cache miss
 
     // If not in cache or expired, fetch from API
-    $context = stream_context_create($opts);
-    $response = @file_get_contents($url, false, $context);
-
-    // Get the status code
-    $status_code = 0;
-    if (isset($http_response_header[0])) {
-        preg_match('/\d{3}/', $http_response_header[0], $matches);
-        $status_code = intval($matches[0]);
-    }
-    if ($response === false || $status_code < 200 || $status_code >= 300) {
+    $response = getNotamsFromFaa($url, $opts, $pageSize);
+    if ($response === false) {
         $error_message = "Failed to get data from FAA API. Status code: $status_code";
         if ($status_code >= 500) {
             error_log("Server error when accessing FAA API: $status_code");
@@ -125,38 +117,94 @@ function getCachedOrFreshData($pdo, $url, $opts, $cacheTime = 3600) {
     return $response;
 }
 
+function getNotamsFromFaa($url, $opts, $pageSize){
+    $allItems = [];
+    $pageNum = 1;
+    $hasMorePages = true;
+
+    while ($hasMorePages) {
+        $paginatedUrl = $url . '&pageNum=' . $pageNum;
+
+        // Make the request
+        $context = stream_context_create($opts);
+        $response = @file_get_contents($paginatedUrl, false, $context);
+
+        // Get the status code
+        $status_code = 0;
+        if (isset($http_response_header[0])) {
+            preg_match('/\d{3}/', $http_response_header[0], $matches);
+            $status_code = intval($matches[0]);
+        }
+
+        // Handle any error in the response
+        if ($response === false || $status_code < 200 || $status_code >= 300) {
+            $error_message = "Failed to get data from FAA API. Status code: $status_code";
+            if ($status_code >= 500) {
+                error_log("Server error when accessing FAA API: $status_code");
+            } elseif ($status_code == 404) {
+                error_log("Resource not found on FAA API: $paginatedUrl");
+            }
+            throw new Exception($error_message);
+        }
+
+        // Decode the JSON response
+        $data = json_decode($response, true);
+        if ($data === null) {
+            throw new Exception("Failed to decode JSON response from FAA API");
+        }
+
+        // Append the items to the allItems array
+        if (isset($data['items'])) {
+            $allItems = array_merge($allItems, $data['items']);
+        }
+
+        // Check if there are more pages
+        if (isset($data['pageNum']) && isset($data['totalPages'])) {
+            $hasMorePages = $data['pageNum'] < $data['totalPages'];
+            $pageNum++; // Move to the next page
+        } else {
+            // If the pagination info is missing, stop the loop
+            $hasMorePages = false;
+        }
+    }
+
+    // Construct the final response
+    $finalResponse = [
+        'pageSize' => $pageSize,
+        'pageNum' => 1, // Since we're combining all pages, set the current page to 1
+        'totalCount' => sizeof($allItems),
+        'totalPages' => 1, // Since all data is combined into one response, totalPages is 1
+        'items' => $allItems
+    ];
+
+    return json_encode($finalResponse);
+}
+
+
 function isValidLatitude($input) {
-    // Define the regular expression pattern for latitude and longitude
-    $pattern = '/^(-?\d+(\.\d+)?)$/';
-
-    // Use preg_match to check if the input string matches the pattern
-    if (preg_match($pattern, $input) !== 1) {
-        return false; // Format is invalid
-    }
-
     // Validate latitude and longitude ranges
-    if (!is_numeric($input) || $input < -90 || $input > 90) {
-        return false; // Invalid latitude range
+    if (isValidDegree($input) || $input >= -90 || $input <= 90) {
+        return true;
+    } else {
+        return false;
     }
-
-    return true; // Input string is valid
 }
 
 function isValidLongitude($input) {
+    // Validate latitude and longitude ranges
+    if (isValidDegree($input) || $input >= -180 || $input <= 180) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function isValidDegree($input) {
     // Define the regular expression pattern for latitude and longitude
     $pattern = '/^(-?\d+(\.\d+)?)$/';
 
     // Use preg_match to check if the input string matches the pattern
-    if (preg_match($pattern, $input) !== 1) {
-        return false; // Format is invalid
-    }
-
-    // Validate latitude and longitude ranges
-    if (!is_numeric($input) || $input < -180 || $input > 180) {
-        return false; // Invalid longitude range
-    }
-
-    return true; // Input string is valid
+    return preg_match($pattern, $input) === 1 && !is_numeric($input);
 }
 
 function isValidRadius($input) {
@@ -179,7 +227,7 @@ try {
     $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_INT);
     $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
 
-    if (!$longitude || !$latitude || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
+    if (!isset($latitude) || !isset($longitude) || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
       throw new InvalidArgumentException("Invalid input parameters");
     }
 
@@ -202,7 +250,7 @@ try {
     );
 
     // Get data (cached or fresh)
-    $response = getCachedOrFreshData($pdo, $url, $opts);
+    $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
