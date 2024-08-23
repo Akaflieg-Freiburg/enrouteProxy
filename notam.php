@@ -183,7 +183,7 @@ function getNotamsFromFaa($url, $opts, $pageSize){
 
 function isValidLatitude($input) {
     // Validate latitude and longitude ranges
-    if (isValidDegree($input) || $input >= -90 || $input <= 90) {
+    if (isValidDegree($input) && $input >= -90 && $input <= 90) {
         return true;
     } else {
         return false;
@@ -192,7 +192,7 @@ function isValidLatitude($input) {
 
 function isValidLongitude($input) {
     // Validate latitude and longitude ranges
-    if (isValidDegree($input) || $input >= -180 || $input <= 180) {
+    if (isValidDegree($input) && $input >= -180 && $input <= 180) {
         return true;
     } else {
         return false;
@@ -204,7 +204,7 @@ function isValidDegree($input) {
     $pattern = '/^(-?\d+(\.\d+)?)$/';
 
     // Use preg_match to check if the input string matches the pattern
-    return preg_match($pattern, $input) === 1 && !is_numeric($input);
+    return preg_match($pattern, $input) === 1;
 }
 
 function isValidRadius($input) {
