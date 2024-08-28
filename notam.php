@@ -1,5 +1,4 @@
 <?php
-header("Content-Type: application/json");
 
 // Dieses Skript liest NOTAMs über eine für maschinelle Anfragen 
 // vorgesehene Schnittstelle der Federal Aviation Administration (FAA)
