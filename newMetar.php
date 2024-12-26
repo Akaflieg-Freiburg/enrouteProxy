@@ -58,7 +58,7 @@ class MetarService {
 
         try {
             // Clear existing data
-            $this->pdo->exec("TRUNCATE TABLE metar_cache");
+            $this->pdo->exec("DELETE FROM metar_cache");
             
             $insertSql = "INSERT INTO metar_cache 
                          (station_id, latitude, longitude, metar_data) 
@@ -76,7 +76,7 @@ class MetarService {
             
             $this->pdo->commit();
         } catch (Exception $e) {
-            // $this->pdo->rollBack();
+            $this->pdo->rollBack();
             throw new Exception("Failed to update database: " . $e->getMessage());
         }
     }
