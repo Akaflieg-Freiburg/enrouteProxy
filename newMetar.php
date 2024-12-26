@@ -67,9 +67,9 @@ class MetarService {
         
         try {
             // Clear existing data
-            $this->pdo->exec("TRUNCATE TABLE metar_stations");
+            $this->pdo->exec("TRUNCATE TABLE metar_cache");
             
-            $insertSql = "INSERT INTO metar_stations 
+            $insertSql = "INSERT INTO metar_cache 
                          (station_id, latitude, longitude, metar_data) 
                          VALUES (?, ?, ?, ?)";
             $stmt = $this->pdo->prepare($insertSql);
