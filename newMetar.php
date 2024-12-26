@@ -50,21 +50,9 @@ class MetarService {
     }
 
     private function updateDatabase($xmlData) {
-        // First parse the XML outside the transaction
-        try {
-            $xml = new SimpleXMLElement($xmlData);
-        } catch (Exception $e) {
-            throw new Exception("Failed to parse METAR XML data: " . $e->getMessage());
-        }
+        $xml = new SimpleXMLElement($xmlData);
         
-        // Store current transaction state
-        $hadTransaction = $this->pdo->inTransaction();
-        
-        // Only start a transaction if we don't already have one
-        if (!$hadTransaction) {
-            $this->pdo->beginTransaction();
-        }
-        
+        $this->pdo->beginTransaction();
         try {
             // Clear existing data
             $this->pdo->exec("TRUNCATE TABLE metar_cache");
@@ -83,20 +71,9 @@ class MetarService {
                 ]);
             }
             
-            // Only commit if we started the transaction
-            if (!$hadTransaction) {
-                $this->pdo->commit();
-            }
+            $this->pdo->commit();
         } catch (Exception $e) {
-            // Only roll back if we started the transaction
-            if (!$hadTransaction && $this->pdo->inTransaction()) {
-                try {
-                    $this->pdo->rollBack();
-                } catch (Exception $rollbackException) {
-                    throw new Exception("Failed to roll back transaction after error: " . 
-                        $rollbackException->getMessage() . ". Original error: " . $e->getMessage());
-                }
-            }
+            $this->pdo->rollBack();
             throw new Exception("Failed to update database: " . $e->getMessage());
         }
     }
