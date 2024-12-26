@@ -50,14 +50,26 @@ class MetarService {
     }
 
     private function updateDatabase($xmlData) {
-        $xml = new SimpleXMLElement($xmlData);
+        // First parse the XML outside the transaction
+        try {
+            $xml = new SimpleXMLElement($xmlData);
+        } catch (Exception $e) {
+            throw new Exception("Failed to parse METAR XML data: " . $e->getMessage());
+        }
         
-        $this->pdo->beginTransaction();
+        // Store current transaction state
+        $hadTransaction = $this->pdo->inTransaction();
+        
+        // Only start a transaction if we don't already have one
+        if (!$hadTransaction) {
+            $this->pdo->beginTransaction();
+        }
+        
         try {
             // Clear existing data
-            $this->pdo->exec("TRUNCATE TABLE metar_cache");
+            $this->pdo->exec("TRUNCATE TABLE metar_stations");
             
-            $insertSql = "INSERT INTO metar_cache 
+            $insertSql = "INSERT INTO metar_stations 
                          (station_id, latitude, longitude, metar_data) 
                          VALUES (?, ?, ?, ?)";
             $stmt = $this->pdo->prepare($insertSql);
@@ -71,9 +83,20 @@ class MetarService {
                 ]);
             }
             
-            $this->pdo->commit();
+            // Only commit if we started the transaction
+            if (!$hadTransaction) {
+                $this->pdo->commit();
+            }
         } catch (Exception $e) {
-            $this->pdo->rollBack();
+            // Only roll back if we started the transaction
+            if (!$hadTransaction && $this->pdo->inTransaction()) {
+                try {
+                    $this->pdo->rollBack();
+                } catch (Exception $rollbackException) {
+                    throw new Exception("Failed to roll back transaction after error: " . 
+                        $rollbackException->getMessage() . ". Original error: " . $e->getMessage());
+                }
+            }
             throw new Exception("Failed to update database: " . $e->getMessage());
         }
     }
