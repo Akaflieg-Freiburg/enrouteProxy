@@ -1,5 +1,14 @@
 <?php
-// metar.php
+// metar.php and notam.php are two PHP scripts that provide METAR and NOTAM data, respectively.
+// The scripts are used to fetch data from external sources and store it in a local database.
+// The scripts are called by a web application to retrieve the data based on user input.
+// The scripts are functional but have some issues that need to be addressed.
+// Your task is to refactor the scripts to improve their structure, security, and maintainability.
+// You can modify the existing code and add new code as needed.
+// You can also create additional files or functions if necessary.
+// The refactored code should be well-organized, easy to read, and well-documented.
+// Please describe the improvements you made and the reasons for each change.
+
 
 // Set error reporting for production
 error_reporting(E_ERROR);
