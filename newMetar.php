@@ -52,7 +52,10 @@ class MetarService {
     private function updateDatabase($xmlData) {
         $xml = new SimpleXMLElement($xmlData);
         
-        $this->pdo->beginTransaction();
+        if (!$this->pdo->beginTransaction()) {
+            throw new Exception("Failed to begin transaction.");
+        }
+
         try {
             // Clear existing data
             $this->pdo->exec("TRUNCATE TABLE metar_cache");
