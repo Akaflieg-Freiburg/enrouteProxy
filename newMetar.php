@@ -76,7 +76,7 @@ class MetarService {
             
             $this->pdo->commit();
         } catch (Exception $e) {
-            $this->pdo->rollBack();
+            // $this->pdo->rollBack();
             throw new Exception("Failed to update database: " . $e->getMessage());
         }
     }
