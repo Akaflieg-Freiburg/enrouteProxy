@@ -1,24 +1,60 @@
 <?php
-// metar.php and notam.php are two PHP scripts that provide METAR and NOTAM data, respectively.
-// The scripts are used to fetch data from external sources and store it in a local database.
-// The scripts are called by a web application to retrieve the data based on user input.
-// The scripts are functional but have some issues that need to be addressed.
-// Your task is to refactor the scripts to improve their structure, security, and maintainability.
-// You can modify the existing code and add new code as needed.
-// You can also create additional files or functions if necessary.
-// The refactored code should be well-organized, easy to read, and well-documented.
-// Please describe the improvements you made and the reasons for each change.
 
+/**
+ * METAR Information Web Service
+ * 
+ * This script provides a web service that serves METAR (Meteorological Terminal Aviation Routine) 
+ * weather reports for a specified geographic area. The data is sourced from aviationweather.gov 
+ * and cached in a MySQL database for improved performance.
+ * 
+ * Features:
+ * - Retrieves and caches METAR data from aviationweather.gov
+ * - Provides METAR information within a specified bounding box
+ * - Automatic cache updates when data is older than 5 minutes
+ * - XML output format matching aviationweather.gov schema
+ * 
+ * URL Format:
+ * https://your-server.com/path/to/metar.php?format=xml&bbox=minLon,minLat,maxLon,maxLat
+ * 
+ * Example:
+ * https://your-server.com/path/to/metar.php?format=xml&bbox=-5,45,15,55
+ * 
+ * Required Environment Variables:
+ * - DB_USER: Database username
+ * - DB_PASS: Database password
+ * 
+ * @author Your Name
+ * @version 1.0
+ */
 
 // Set error reporting for production
 error_reporting(E_ERROR);
 ini_set('display_errors', 0);
 
+/**
+ * MetarService Class
+ * 
+ * Handles the retrieval, caching, and serving of METAR weather information.
+ */
 class MetarService {
+    /** @var PDO Database connection */
     private $pdo;
+    
+    /** @var string URL for fetching METAR data */
     private $sourceUrl = 'https://aviationweather.gov/data/cache/metars.cache.xml.gz';
-    private $maxAge = 300; // 5 minutes in seconds
+    
+    /** @var int Cache lifetime in seconds (5 minutes) */
+    private $maxAge = 300;
 
+    /**
+     * Constructor - Initializes database connection and ensures table exists
+     * 
+     * @param string $host Database host
+     * @param string $dbname Database name
+     * @param string $username Database username
+     * @param string $password Database password
+     * @throws Exception If database connection fails
+     */
     public function __construct($host, $dbname, $username, $password) {
         try {
             $this->pdo = new PDO(
@@ -34,6 +70,11 @@ class MetarService {
         $this->ensureTableExists();
     }
 
+    /**
+     * Creates the cache table if it doesn't exist
+     * 
+     * @throws Exception If table creation fails
+     */
     private function ensureTableExists() {
         $sql = "CREATE TABLE IF NOT EXISTS metar_cache (
             station_id VARCHAR(10) PRIMARY KEY,
@@ -45,6 +86,11 @@ class MetarService {
         $this->pdo->exec($sql);
     }
 
+    /**
+     * Checks if the cached data needs to be updated
+     * 
+     * @return bool True if cache is older than maxAge or empty
+     */
     private function needsUpdate() {
         $sql = "SELECT MAX(last_updated) as last_update FROM metar_cache";
         $stmt = $this->pdo->query($sql);
@@ -58,6 +104,12 @@ class MetarService {
         return (time() - $lastUpdate) > $this->maxAge;
     }
 
+    /**
+     * Updates the database with new METAR data
+     * 
+     * @param string $xmlData Raw XML data from aviationweather.gov
+     * @throws Exception If database update fails
+     */
     private function updateDatabase($xmlData) {
         $xml = new SimpleXMLElement($xmlData);
         
@@ -90,6 +142,12 @@ class MetarService {
         }
     }
 
+    /**
+     * Fetches METAR data from aviationweather.gov
+     * 
+     * @return string Decompressed XML data
+     * @throws Exception If download or decompression fails
+     */
     private function fetchMetarData() {
         $gzData = file_get_contents($this->sourceUrl);
         if ($gzData === false) {
@@ -103,7 +161,17 @@ class MetarService {
         
         return $xmlData;
     }
-
+    
+    /**
+     * Retrieves METAR data for stations within the specified bounding box
+     * 
+     * @param float $minLon Minimum longitude
+     * @param float $minLat Minimum latitude
+     * @param float $maxLon Maximum longitude
+     * @param float $maxLat Maximum latitude
+     * @return array Array of METAR XML strings
+     * @throws Exception If data retrieval fails
+     */
     public function getMetarsInBoundingBox($minLon, $minLat, $maxLon, $maxLat) {
         if ($this->needsUpdate()) {
             $xmlData = $this->fetchMetarData();
