@@ -23,7 +23,7 @@
  * - DB_USER: Database username
  * - DB_PASS: Database password
  * 
- * @author Your Name
+ * @author Stefan Kebekus
  * @version 1.0
  */
 

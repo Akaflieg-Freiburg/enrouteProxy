@@ -1,90 +1,285 @@
 <?php
-// Dieses Skript liest Wetterdaten über eine für maschinelle
-// Anfragen vorgesehene Schnittstelle des Aviation Weather Center (AWC) 
-// der USA ein und gibt sie im (gleichen) xml-Format aus.
-//
-// Kontakt: Markus Sachs, ms@squawk-vfr.de
-// Geschrieben für Enroute Flight Navigation im Dez. 2023.
-//
-// Weitergehende Informationen über die Datenquelle:
-// https://aviationweather.gov/ bzw. https://aviationweather.gov/data/api/
-//
-// Einschränkung des AWC: "Please keep requests limited in scope and frequency."
-//
-// Aufruf: [Server/htdocs]/get_metar_box.php?box=a,b,c,d&format=e mit 
-// a = bottomLeft.latitude
-// b = bottomLeft.longitude
-// c = topRight.latitude
-// d = topRight.longitude
-//
-// e = desired data format for answer
 
-function isValidBBoxString($input) {
-    // Define the regular expression pattern for latitude and longitude
-    $pattern = '/^(-?\d+(\.\d+)?),(-?\d+(\.\d+)?),(-?\d+(\.\d+)?),(-?\d+(\.\d+)?)$/';
+/**
+ * TAF Information Web Service
+ * 
+ * This script provides a web service that serves TAF (Terminal Aerodrome Forecast) 
+ * weather reports for a specified geographic area. The data is sourced from aviationweather.gov 
+ * and cached in a MySQL database for improved performance.
+ * 
+ * Features:
+ * - Retrieves and caches TAF data from aviationweather.gov
+ * - Provides TAF information within a specified bounding box
+ * - Automatic cache updates when data is older than 5 minutes
+ * - XML output format matching aviationweather.gov schema
+ * 
+ * URL Format:
+ * https://your-server.com/path/to/taf.php?format=xml&bbox=minLon,minLat,maxLon,maxLat
+ * 
+ * Example:
+ * https://your-server.com/path/to/taf.php?format=xml&bbox=-5,45,15,55
+ * 
+ * Required Environment Variables:
+ * - DB_USER: Database username
+ * - DB_PASS: Database password
+ * 
+ * @author Your Name
+ * @version 1.0
+ */
 
-    // Use preg_match to check if the input string matches the pattern
-    if (preg_match($pattern, $input) !== 1) {
-        return false; // Format is invalid
+// Set error reporting for production
+error_reporting(E_ERROR);
+ini_set('display_errors', 0);
+
+/**
+ * TafService Class
+ * 
+ * Handles the retrieval, caching, and serving of TAF weather information.
+ */
+class TafService {
+    /** @var PDO Database connection */
+    private $pdo;
+    
+    /** @var string URL for fetching TAF data */
+    private $sourceUrl = 'https://aviationweather.gov/data/cache/tafs.cache.xml.gz';
+    
+    /** @var int Cache lifetime in seconds (5 minutes) */
+    private $maxAge = 300;
+
+    /**
+     * Constructor - Initializes database connection and ensures table exists
+     * 
+     * @param string $host Database host
+     * @param string $dbname Database name
+     * @param string $username Database username
+     * @param string $password Database password
+     * @throws Exception If database connection fails
+     */
+    public function __construct($host, $dbname, $username, $password) {
+        try {
+            $this->pdo = new PDO(
+                "mysql:host=$host;dbname=$dbname;charset=utf8mb4",
+                $username,
+                $password,
+                [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+            );
+        } catch (PDOException $e) {
+            throw new Exception("Database connection failed: " . $e->getMessage());
+        }
+        
+        $this->ensureTableExists();
     }
 
-    // Split the input string into latitudes and longitudes
-    list($lat1, $lon1, $lat2, $lon2) = explode(',', $input);
-
-    // Validate latitude and longitude ranges
-    if (!is_numeric($lat1) || $lat1 < -90 || $lat1 > 90 || !is_numeric($lat2) || $lat2 < -90 || $lat2 > 90) {
-        return false; // Invalid latitude range
+    /**
+     * Creates the cache table if it doesn't exist
+     * 
+     * @throws Exception If table creation fails
+     */
+    private function ensureTableExists() {
+        $sql = "CREATE TABLE IF NOT EXISTS taf_cache (
+            station_id VARCHAR(10) PRIMARY KEY,
+            latitude DECIMAL(10, 6),
+            longitude DECIMAL(10, 6),
+            taf_data TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )";
+        $this->pdo->exec($sql);
     }
 
-    if (!is_numeric($lon1) || $lon1 < -180 || $lon1 > 180 || !is_numeric($lon2) || $lon2 < -180 || $lon2 > 180) {
-        return false; // Invalid longitude range
+    /**
+     * Checks if the cached data needs to be updated
+     * 
+     * @return bool True if cache is older than maxAge or empty
+     */
+    private function needsUpdate() {
+        $sql = "SELECT MAX(last_updated) as last_update FROM taf_cache";
+        $stmt = $this->pdo->query($sql);
+        $result = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$result['last_update']) {
+            return true;
+        }
+        
+        $lastUpdate = strtotime($result['last_update']);
+        return (time() - $lastUpdate) > $this->maxAge;
     }
 
-    return true; // Input string is valid
+    /**
+     * Updates the database with new TAF data
+     * 
+     * @param string $xmlData Raw XML data from aviationweather.gov
+     * @throws Exception If database update fails
+     */
+    private function updateDatabase($xmlData) {
+        $xml = new SimpleXMLElement($xmlData);
+        
+        if (!$this->pdo->beginTransaction()) {
+            throw new Exception("Failed to begin transaction.");
+        }
+
+        try {
+            // Clear existing data
+            $this->pdo->exec("DELETE FROM taf_cache");
+            
+            $insertSql = "INSERT INTO taf_cache 
+                         (station_id, latitude, longitude, taf_data) 
+                         VALUES (?, ?, ?, ?)";
+            $stmt = $this->pdo->prepare($insertSql);
+            
+            foreach ($xml->data->TAF as $taf) {
+                $stmt->execute([
+                    (string)$taf->station_id,
+                    (float)$taf->latitude,
+                    (float)$taf->longitude,
+                    $taf->asXML()
+                ]);
+            }
+            
+            $this->pdo->commit();
+        } catch (Exception $e) {
+            $this->pdo->rollBack();
+            throw new Exception("Failed to update database: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Fetches TAF data from aviationweather.gov
+     * 
+     * @return string Decompressed XML data
+     * @throws Exception If download or decompression fails
+     */
+    private function fetchTafData() {
+        $gzData = file_get_contents($this->sourceUrl);
+        if ($gzData === false) {
+            throw new Exception("Failed to download TAF data");
+        }
+        
+        $xmlData = gzdecode($gzData);
+        if ($xmlData === false) {
+            throw new Exception("Failed to decompress TAF data");
+        }
+        
+        return $xmlData;
+    }
+
+    /**
+     * Retrieves TAF data for stations within the specified bounding box
+     * 
+     * @param float $minLon Minimum longitude
+     * @param float $minLat Minimum latitude
+     * @param float $maxLon Maximum longitude
+     * @param float $maxLat Maximum latitude
+     * @return array Array of TAF XML strings
+     * @throws Exception If data retrieval fails
+     */
+    public function getTafsInBoundingBox($minLon, $minLat, $maxLon, $maxLat) {
+        if ($this->needsUpdate()) {
+            $xmlData = $this->fetchTafData();
+            $this->updateDatabase($xmlData);
+        }
+        
+        $sql = "SELECT taf_data FROM taf_cache 
+                WHERE latitude BETWEEN ? AND ?
+                AND longitude BETWEEN ? AND ?";
+        
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([$minLat, $maxLat, $minLon, $maxLon]);
+        
+        return $stmt->fetchAll(PDO::FETCH_COLUMN);
+    }
 }
 
-function isValidFormatString($input) {
-    // Define the regular expression pattern
-    $pattern = '/\b(?:json|xml)\b/';
+// Configuration
+$config = [
+    'host' => 'sql731.your-server.de',
+    'dbname' => 'enroutecaches',
+    'username' => getenv('DB_USER'),
+    'password' => getenv('DB_PASS')
+];
 
-    // Use preg_match_all to find all occurrences of "json" or "xml" in the input string
-    preg_match_all($pattern, $input, $matches);
+// Validate input parameters
+$format = $_GET['format'] ?? '';
+$bbox = $_GET['bbox'] ?? '';
 
-    // Check if exactly one match is found
-    return count($matches[0]) === 1;
+if ($format !== 'xml') {
+    header('Content-Type: application/xml');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Invalid format parameter. Only XML is supported.</error></errors></response>');
+    echo $error->asXML();
+    exit;
 }
 
+if (empty($bbox)) {
+    header('Content-Type: application/xml');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Missing bbox parameter</error></errors></response>');
+    echo $error->asXML();
+    exit;
+}
 
-//
-// Get parameter and check for validity
-//
+// Parse and validate bbox parameter
+$coords = array_map('floatval', explode(',', $bbox));
+if (count($coords) !== 4) {
+    header('Content-Type: application/xml');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Invalid bbox format. Expected: minLon,minLat,maxLon,maxLat</error></errors></response>');
+    echo $error->asXML();
+    exit;
+}
 
-if (!isset($_GET['bbox'])) die('Error: bbox definition missing!');
-$bbox   = $_GET['bbox'];
-if (!isValidBBoxString($bbox)) die('Invalid bounding box string!');
+[$minLon, $minLat, $maxLon, $maxLat] = $coords;
 
-if (!isset($_GET['format'])) die('Error: format definition missing!');
-$format = $_GET['format'];
-if (!isValidFormatString($format)) die('Invalid format string!');
+// Validate coordinate ranges
+if ($minLat < -90 || $maxLat > 90 || $minLon < -180 || $maxLon > 180 || $minLat > $maxLat || $minLon > $maxLon) {
+    header('Content-Type: application/xml');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Invalid coordinate ranges</error></errors></response>');
+    echo $error->asXML();
+    exit;
+}
 
+try {
+    $tafService = new TafService(
+        $config['host'],
+        $config['dbname'],
+        $config['username'],
+        $config['password']
+    );
 
-//
-// Build request
-//
-
-$url = "https://aviationweather.gov/api/data/taf?bbox=$bbox&format=$format";
-
-
-//
-// Get data
-//
-
-$data = file_get_contents($url) OR die('Query incorrect or service not available');
-
-
-//
-// Return data
-//
-echo($data);
-
-?>
+    $tafs = $tafService->getTafsInBoundingBox($minLon, $minLat, $maxLon, $maxLat);
+    
+    // Create response XML
+    $output = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?>' .
+        '<response version="1.3" ' .
+        'xsi:noNamespaceSchemaLocation="https://aviationweather.gov/data/schema/taf1_3.xsd" ' .
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' .
+        '<data_source name="tafs"/>' .
+        '<request type="retrieve"/>' .
+        '<errors/>' .
+        '<warnings/>' .
+        '<time_taken_ms>0</time_taken_ms>' .
+        '<data/></response>');
+    
+    // Set number of results
+    $output->data->addAttribute('num_results', count($tafs));
+    
+    // Add each TAF to the response
+    foreach ($tafs as $tafXml) {
+        $taf = new SimpleXMLElement($tafXml);
+        $newTaf = $output->data->addChild('TAF');
+        foreach ($taf->children() as $child) {
+            $newChild = $newTaf->addChild($child->getName(), (string)$child);
+            // Copy all attributes
+            foreach ($child->attributes() as $key => $value) {
+                $newChild->addAttribute($key, (string)$value);
+            }
+        }
+    }
+    
+    // Output XML
+    header('Content-Type: application/xml');
+    echo $output->asXML();
+    
+} catch (Exception $e) {
+    header('Content-Type: application/xml');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>' . 
+        htmlspecialchars($e->getMessage()) . 
+        '</error></errors></response>');
+    echo $error->asXML();
+}
