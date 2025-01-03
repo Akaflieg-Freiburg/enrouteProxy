@@ -23,7 +23,7 @@
  * - DB_USER: Database username
  * - DB_PASS: Database password
  * 
- * @author Your Name
+ * @author Stefan Kebekus
  * @version 1.0
  */
 
@@ -224,7 +224,7 @@ if (count($coords) !== 4) {
     exit;
 }
 
-[$minLon, $minLat, $maxLon, $maxLat] = $coords;
+[$minLat, $minLon, $maxLat, $maxLon] = $coords;
 
 // Validate coordinate ranges
 if ($minLat < -90 || $maxLat > 90 || $minLon < -180 || $maxLon > 180 || $minLat > $maxLat || $minLon > $maxLon) {
