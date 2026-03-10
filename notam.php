@@ -179,7 +179,6 @@ function getNotamsFromFaa($url, $opts, $pageSize){
     return json_encode($finalResponse);
 }
 
-
 function isValidLatitude($input) {
     // Validate latitude and longitude ranges
     if (isValidDegree($input) && $input >= -90 && $input <= 90) {
@@ -216,10 +215,7 @@ function isValidPageSize($input) {
     return is_numeric($input) && $input > 0 && $input <= 1000 && intval($input) == $input;
 }
 
-
 try {
-    $pdo = getDbConnection();
-
     // Input validation and sanitization
     $longitude = filter_input(INPUT_GET, 'locationLongitude', FILTER_VALIDATE_FLOAT);
     $latitude = filter_input(INPUT_GET, 'locationLatitude', FILTER_VALIDATE_FLOAT);
@@ -248,11 +244,20 @@ try {
         )
     );
 
+    // Get Data from FAA API (without caching, for testing purposes)
+    $response = getNotamsFromFaa($url, $opts, $pageSize);
+    if ($response === false) {
+        throw new Exception("Failed to get NOTAM data from FAA API");
+    }
+
     // Get data (cached or fresh)
+    /*
+    $pdo = getDbConnection();
     $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
+    */
 
     // Return data
     header('Content-Type: application/json');
