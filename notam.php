@@ -238,7 +238,9 @@ function getNotamsFromFaa($url, $opts, $pageSize) {
 
         // Append the items to the allItems array
         if (isset($data['data'])) {
-            $allItems = array_merge($allItems, $data['data']);
+            if (isset($data['data']['geojson'])) {
+                $allItems = array_merge($allItems, $data['data']['geojson']);
+            }
         }
 
         // Check if there are more pages
