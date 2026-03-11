@@ -133,6 +133,37 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     return $response;
 }
 
+function getToken(PDO $pdo): string
+{
+    $row = fetchTokenFromCache($pdo);
+
+    if ($row !== null && isTokenStillValid($row['expires_at'])) {
+        return $row['access_token'];
+    }
+
+    return getTokenFromFaa($pdo);
+}
+
+function fetchTokenFromCache(PDO $pdo): ?array
+{
+    $stmt = $pdo->query(
+        "SELECT access_token, expires_at FROM nms_token_cache WHERE id = 1 LIMIT 1"
+    );
+    $row = $stmt->fetch();
+
+    return $row !== false ? $row : null;
+}
+
+function isTokenStillValid(string $expiresAt): bool
+{
+    $threshold = new \DateTimeImmutable(
+        '+' . TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds'
+    );
+    $tokenExpiry = new \DateTimeImmutable($expiresAt);
+
+    return $threshold < $tokenExpiry;
+}
+
 function getTokenFromFaa($pdo): string
 {
     $authUrl      = getenv('NMS_AUTH_URL');
@@ -318,7 +349,7 @@ try {
     . '&radius='   . $radius;
 
     $pdo = getDbConnection();
-    $token = getTokenFromFaa($pdo);
+    $token = getToken($pdo);
     $opts = ['http' => ['header' => [
         "Authorization: Bearer $token",
         "nmsResponseFormat: geojson"
