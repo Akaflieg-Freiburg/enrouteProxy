@@ -324,19 +324,19 @@ try {
     ]]];
 
     // Get Data from FAA API (without caching, for testing purposes)
-    /*
     $response = getNotamsFromFaa($url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
-    */
 
     // Get data (cached or fresh)
+    /*
     $pdo = getDbConnection();
     $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
+    */
 
     // Return data
     header('Content-Type: application/json');
