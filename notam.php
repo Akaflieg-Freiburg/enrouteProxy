@@ -156,8 +156,10 @@ function fetchTokenFromCache(PDO $pdo): ?array
 
 function isTokenStillValid(string $expiresAt): bool
 {
+    $TOKEN_RENEWAL_BUFFER_SECONDS = 60;
+    
     $threshold = new \DateTimeImmutable(
-        '+' . TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds'
+        '+' . $TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds'
     );
     $tokenExpiry = new \DateTimeImmutable($expiresAt);
 
