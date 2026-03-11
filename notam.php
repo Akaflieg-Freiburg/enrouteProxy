@@ -217,14 +217,15 @@ function getTokenFromFaa($pdo): string
     $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
         ->modify("+{$expiresIn} seconds")
         ->format('Y-m-d H:i:s');
+    $updatedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
     $stmt = $pdo->prepare(
         "INSERT INTO nms_token_cache (id, access_token, expires_at, updated_at)
-         VALUES (1, :token, :expires_at, NOW())
+         VALUES (1, :token, :expires_at, UTC_TIMESTAMP())
          ON DUPLICATE KEY UPDATE
              access_token = VALUES(access_token),
              expires_at   = VALUES(expires_at),
-             updated_at   = NOW()"
+             updated_at   = UTC_TIMESTAMP()"
     );
     $stmt->execute([
         ':token'      => $data['access_token'],
