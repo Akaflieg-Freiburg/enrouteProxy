@@ -18,6 +18,23 @@
 // Das Anhängen von &pageSize=d mit d als gewünschter Zahl ist optional; 
 // ohne Nennung wird 1000 als Default gesetzt.
 
+/**
+ * Extrahiert den HTTP-Statuscode aus den Response-Headern von
+ * file_get_contents().
+ *
+ * @param string[] $responseHeaders
+ */
+function extractHttpStatusCode(array $responseHeaders): int
+{
+    if (empty($responseHeaders[0])) {
+        return 0;
+    }
+
+    preg_match('/HTTP\/\S+\s+(\d{3})/', $responseHeaders[0], $matches);
+
+    return isset($matches[1]) ? (int)$matches[1] : 0;
+}
+
 // Function to get database connection
 function getDbConnection() {
     $host = 'sql731.your-server.de';
@@ -116,16 +133,79 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     return $response;
 }
 
-function getToken() {
-    return "xxx";
+function getTokenFromFaa(): string
+{
+    $authUrl      = getenv('NMS_AUTH_URL');
+    $clientId     = getenv('NMS_CLIENT_ID');
+    $clientSecret = getenv('NMS_CLIENT_SECRET');
+
+    if (!$authUrl || !$clientId || !$clientSecret) {
+        throw new \RuntimeException(
+            'NMS-Umgebungsvariablen (NMS_AUTH_URL, NMS_CLIENT_ID, NMS_CLIENT_SECRET) fehlen.'
+        );
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method'        => 'POST',
+            'header'        => [
+                'Content-Type: application/x-www-form-urlencoded',
+                'Authorization: Basic ' . base64_encode("{$clientId}:{$clientSecret}"),
+            ],
+            'content'       => 'grant_type=client_credentials',
+            'timeout'       => 10,
+            'ignore_errors' => true,
+        ],
+    ]);
+
+    $raw = @file_get_contents($authUrl, false, $context);
+
+    if ($raw === false) {
+        throw new \RuntimeException('Netzwerkfehler beim Abrufen des Bearer-Tokens.');
+    }
+
+    $statusCode = extractHttpStatusCode($http_response_header ?? []);
+
+    if ($statusCode < 200 || $statusCode >= 300) {
+        throw new \RuntimeException(
+            "Auth-Endpunkt antwortete mit HTTP {$statusCode}."
+        );
+    }
+
+    $data = json_decode($raw, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE || empty($data['access_token'])) {
+        throw new \RuntimeException(
+            'Ungültige Auth-Antwort: kein access_token erhalten.'
+        );
+    }
+
+    $expiresIn = (int)($data['expires_in'] ?? 1799);
+    $expiresAt = (new \DateTimeImmutable())
+        ->modify("+{$expiresIn} seconds")
+        ->format('Y-m-d H:i:s');
+
+    /*
+    $stmt = $pdo->prepare(
+        "INSERT INTO nms_token_cache (id, access_token, expires_at, updated_at)
+         VALUES (1, :token, :expires_at, NOW())
+         ON DUPLICATE KEY UPDATE
+             access_token = VALUES(access_token),
+             expires_at   = VALUES(expires_at),
+             updated_at   = NOW()"
+    );
+    $stmt->execute([
+        ':token'      => $data['access_token'],
+        ':expires_at' => $expiresAt,
+    ]);
+    */
+    return $data['access_token'];
 }
 
 function getNotamsFromFaa($url, $opts, $pageSize) {
     $allItems = [];
     $pageNum = 1;
     $hasMorePages = true;
-
-    $accessToken = getToken();
 
     while ($hasMorePages) {
         $paginatedUrl = $url . '&pageNum=' . $pageNum;
@@ -159,8 +239,8 @@ function getNotamsFromFaa($url, $opts, $pageSize) {
         }
 
         // Append the items to the allItems array
-        if (isset($data['items'])) {
-            $allItems = array_merge($allItems, $data['items']);
+        if (isset($data['data'])) {
+            $allItems = array_merge($allItems, $data['data']);
         }
 
         // Check if there are more pages
@@ -181,7 +261,6 @@ function getNotamsFromFaa($url, $opts, $pageSize) {
         'totalPages' => 1, // Since all data is combined into one response, totalPages is 1
         'items' => $allItems
     ];
-
     return json_encode($finalResponse);
 }
 
@@ -232,38 +311,32 @@ try {
       throw new InvalidArgumentException("Invalid input parameters");
     }
 
-
     // Build request
-    $url = 'https://external-api.faa.gov/notamapi/v1/notams?'
-    . 'locationLongitude=' . $longitude
-    . '&locationLatitude=' . $latitude
-    . '&locationRadius=' . $radius
-    . '&pageSize=' . $pageSize;
+    $url = getenv('NMS_API_BASE') . '/notams?'
+    . 'longitude=' . $longitude
+    . '&latitude=' . $latitude
+    . '&radius='   . $radius;
 
-    $FAA_KEY = getenv('FAA_KEY');
-    $FAA_ID  = getenv('FAA_ID');
-
-    $opts = array(
-        'http' => array(
-            'header' => "client_id: $FAA_ID\r\n" .
-                        "client_secret: $FAA_KEY\r\n"
-        )
-    );
+    $token = getTokenFromFaa();
+    $opts = ['http' => ['header' => [
+        "Authorization: Bearer $token",
+        "nmsResponseFormat: geojson"
+    ]]];
 
     // Get Data from FAA API (without caching, for testing purposes)
+    /*
     $response = getNotamsFromFaa($url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
+    */
 
     // Get data (cached or fresh)
-    /*
     $pdo = getDbConnection();
     $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
     }
-    */
 
     // Return data
     header('Content-Type: application/json');
