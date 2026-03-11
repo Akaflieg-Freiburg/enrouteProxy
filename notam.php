@@ -133,7 +133,7 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     return $response;
 }
 
-function getTokenFromFaa(): string
+function getTokenFromFaa($pdo): string
 {
     $authUrl      = getenv('NMS_AUTH_URL');
     $clientId     = getenv('NMS_CLIENT_ID');
@@ -185,7 +185,6 @@ function getTokenFromFaa(): string
         ->modify("+{$expiresIn} seconds")
         ->format('Y-m-d H:i:s');
 
-    /*
     $stmt = $pdo->prepare(
         "INSERT INTO nms_token_cache (id, access_token, expires_at, updated_at)
          VALUES (1, :token, :expires_at, NOW())
@@ -198,7 +197,6 @@ function getTokenFromFaa(): string
         ':token'      => $data['access_token'],
         ':expires_at' => $expiresAt,
     ]);
-    */
     return $data['access_token'];
 }
 
@@ -317,7 +315,8 @@ try {
     . '&latitude=' . $latitude
     . '&radius='   . $radius;
 
-    $token = getTokenFromFaa();
+    $pdo = getDbConnection();
+    $token = getTokenFromFaa($pdo);
     $opts = ['http' => ['header' => [
         "Authorization: Bearer $token",
         "nmsResponseFormat: geojson"
@@ -331,7 +330,6 @@ try {
 
     // Get data (cached or fresh)
     /*
-    $pdo = getDbConnection();
     $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
     if ($response === false) {
         throw new Exception("Failed to get NOTAM data from FAA API");
