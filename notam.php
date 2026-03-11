@@ -157,11 +157,11 @@ function fetchTokenFromCache(PDO $pdo): ?array
 function isTokenStillValid(string $expiresAt): bool
 {
     $TOKEN_RENEWAL_BUFFER_SECONDS = 60;
-    
-    $threshold = new \DateTimeImmutable(
-        '+' . $TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds'
-    );
-    $tokenExpiry = new \DateTimeImmutable($expiresAt);
+    $utc = new \DateTimeZone('UTC');
+
+    $threshold   = new \DateTimeImmutable('now', $utc);
+    $threshold   = $threshold->modify('+' . $TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds');
+    $tokenExpiry = new \DateTimeImmutable($expiresAt, $utc);
 
     return $threshold < $tokenExpiry;
 }
@@ -214,7 +214,7 @@ function getTokenFromFaa($pdo): string
     }
 
     $expiresIn = (int)($data['expires_in'] ?? 1799);
-    $expiresAt = (new \DateTimeImmutable())
+    $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
         ->modify("+{$expiresIn} seconds")
         ->format('Y-m-d H:i:s');
 
