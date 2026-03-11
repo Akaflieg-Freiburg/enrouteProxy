@@ -116,10 +116,16 @@ function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
     return $response;
 }
 
-function getNotamsFromFaa($url, $opts, $pageSize){
+function getToken() {
+    return "xxx";
+}
+
+function getNotamsFromFaa($url, $opts, $pageSize) {
     $allItems = [];
     $pageNum = 1;
     $hasMorePages = true;
+
+    $accessToken = getToken();
 
     while ($hasMorePages) {
         $paginatedUrl = $url . '&pageNum=' . $pageNum;
