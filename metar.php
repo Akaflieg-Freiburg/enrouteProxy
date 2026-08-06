@@ -14,10 +14,10 @@
  * - XML output format matching aviationweather.gov schema
  * 
  * URL Format:
- * https://your-server.com/path/to/metar.php?format=xml&bbox=minLon,minLat,maxLon,maxLat
+ * https://your-server.com/path/to/metar.php?format=xml&bbox=minLat,minLon,maxLat,maxLon
  * 
  * Example:
- * https://your-server.com/path/to/metar.php?format=xml&bbox=-5,45,15,55
+ * https://your-server.com/path/to/metar.php?format=xml&bbox=45,-5,55,15
  * 
  * Required Environment Variables:
  * - DB_USER: Database username
@@ -121,9 +121,15 @@ class MetarService {
             // Clear existing data
             $this->pdo->exec("DELETE FROM metar_cache");
             
-            $insertSql = "INSERT INTO metar_cache 
-                         (station_id, latitude, longitude, metar_data) 
-                         VALUES (?, ?, ?, ?)";
+            // The upstream cache file occasionally contains the same station
+            // twice; keep the last entry instead of failing on the PRIMARY KEY.
+            $insertSql = "INSERT INTO metar_cache
+                         (station_id, latitude, longitude, metar_data)
+                         VALUES (?, ?, ?, ?)
+                         ON DUPLICATE KEY UPDATE
+                         latitude = VALUES(latitude),
+                         longitude = VALUES(longitude),
+                         metar_data = VALUES(metar_data)";
             $stmt = $this->pdo->prepare($insertSql);
             
             foreach ($xml->data->METAR as $metar) {
@@ -149,7 +155,8 @@ class MetarService {
      * @throws Exception If download or decompression fails
      */
     private function fetchMetarData() {
-        $gzData = file_get_contents($this->sourceUrl);
+        $context = stream_context_create(['http' => ['timeout' => 15]]);
+        $gzData = file_get_contents($this->sourceUrl, false, $context);
         if ($gzData === false) {
             throw new Exception("Failed to download METAR data");
         }
@@ -163,6 +170,29 @@ class MetarService {
     }
     
     /**
+     * Refreshes the cache from aviationweather.gov
+     *
+     * Only one process refreshes at a time; concurrent requests keep being
+     * served from the existing cache. If the refresh fails, the error is
+     * logged and stale data continues to be served.
+     */
+    private function refreshCache() {
+        $stmt = $this->pdo->query("SELECT GET_LOCK('metar_cache_refresh', 0)");
+        if ($stmt->fetchColumn() != 1) {
+            return;
+        }
+        try {
+            if ($this->needsUpdate()) {
+                $this->updateDatabase($this->fetchMetarData());
+            }
+        } catch (Exception $e) {
+            error_log("METAR cache refresh failed: " . $e->getMessage());
+        } finally {
+            $this->pdo->query("SELECT RELEASE_LOCK('metar_cache_refresh')");
+        }
+    }
+
+    /**
      * Retrieves METAR data for stations within the specified bounding box
      * 
      * @param float $minLon Minimum longitude
@@ -174,8 +204,7 @@ class MetarService {
      */
     public function getMetarsInBoundingBox($minLon, $minLat, $maxLon, $maxLat) {
         if ($this->needsUpdate()) {
-            $xmlData = $this->fetchMetarData();
-            $this->updateDatabase($xmlData);
+            $this->refreshCache();
         }
         
         $sql = "SELECT metar_data FROM metar_cache 
@@ -219,7 +248,7 @@ if (empty($bbox)) {
 $coords = array_map('floatval', explode(',', $bbox));
 if (count($coords) !== 4) {
     header('Content-Type: application/xml');
-    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Invalid bbox format. Expected: minLon,minLat,maxLon,maxLat</error></errors></response>');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Invalid bbox format. Expected: minLat,minLon,maxLat,maxLon</error></errors></response>');
     echo $error->asXML();
     exit;
 }
@@ -264,7 +293,8 @@ try {
         $metar = new SimpleXMLElement($metarXml);
         $newMetar = $output->data->addChild('METAR');
         foreach ($metar->children() as $child) {
-            $newChild = $newMetar->addChild($child->getName(), (string)$child);
+            // addChild() does not escape ampersands in the value
+            $newChild = $newMetar->addChild($child->getName(), str_replace('&', '&amp;', (string)$child));
             // Copy all attributes
             foreach ($child->attributes() as $key => $value) {
                 $newChild->addAttribute($key, (string)$value);
@@ -277,9 +307,9 @@ try {
     echo $output->asXML();
     
 } catch (Exception $e) {
+    // Log the details; do not expose internals to the client
+    error_log("metar.php: " . $e->getMessage());
     header('Content-Type: application/xml');
-    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>' . 
-        htmlspecialchars($e->getMessage()) . 
-        '</error></errors></response>');
+    $error = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><response><errors><error>Internal server error</error></errors></response>');
     echo $error->asXML();
 }

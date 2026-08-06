@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sS -i --max-time 30 \"https://enroute-data.akaflieg-freiburg.de/enrouteProxy/metar.php?format=xml&bbox=45,5,55,15\")",
+      "Bash(curl -sS --max-time 60 -o metars.cache.xml.gz \"https://aviationweather.gov/data/cache/metars.cache.xml.gz\")",
+      "Bash(gunzip -kf metars.cache.xml.gz)",
+      "Bash(curl -sS --max-time 30 \"https://enroute-data.akaflieg-freiburg.de/enrouteProxy/taf.php?format=xml&bbox=45,5,55,15\")",
+      "Bash(curl -sS --max-time 60 -o tafs.cache.xml.gz \"https://aviationweather.gov/data/cache/tafs.cache.xml.gz\")",
+      "Bash(gunzip -kf tafs.cache.xml.gz)",
+      "Bash(php -l /home/kebekus/Software/projects/enrouteProxy/metar.php)",
+      "Bash(php -l /home/kebekus/Software/projects/enrouteProxy/taf.php)",
+      "Bash(php -r ' *)",
+      "Bash(sed -n '279,292l' /home/kebekus/Software/projects/enrouteProxy/metar.php)",
+      "Bash(sed -n '280,293l' /home/kebekus/Software/projects/enrouteProxy/taf.php)"
+    ]
+  }
+}
