@@ -1,8 +1,7 @@
 <?php
 
-// Dieses Skript liest NOTAMs über eine für maschinelle Anfragen 
-// vorgesehene Schnittstelle der Federal Aviation Administration (FAA)
-// der USA ein und gibt sie aus.
+// Dieses Skript liest NOTAMs über die NOTAM Management Service (NMS) API der
+// Federal Aviation Administration (FAA) der USA ein und gibt sie aus.
 //
 // Kontakt: Markus Sachs, ms@squawk-vfr.de
 // Geschrieben für Enroute Flight Navigation im Jan. 2024.
@@ -10,13 +9,63 @@
 // Weitergehende Informationen über die Datenquelle:
 // https://www.faa.gov/
 //
-// Aufruf: [Server/htdocs]/notams.php?locationLongitude=a&locationLatitude=b&radius=c
-// mit 
-// a = Längengrad (Punkt als Dezimalkomma) des Zentrums der Suche
-// b = Breitengrad (Punkt als Dezimalkomma) des Zentrums der Suche
-// c = Radius der Suche in [Einheit?]
-// Das Anhängen von &pageSize=d mit d als gewünschter Zahl ist optional; 
-// ohne Nennung wird 1000 als Default gesetzt.
+// Aufruf: [Server/htdocs]/notam.php?locationLongitude=a&locationLatitude=b&locationRadius=c
+// mit
+// a = Längengrad (Punkt als Dezimaltrenner) des Zentrums der Suche
+// b = Breitengrad (Punkt als Dezimaltrenner) des Zentrums der Suche
+// c = Radius der Suche in Nautischen Meilen (ganzzahlig, 1 bis 100;
+//     die FAA lehnt größere Werte ab)
+//
+// Antwort: JSON mit den Feldern pageSize, pageNum, totalCount, totalPages und
+// items (alle Seiten der FAA-Antwort zusammengeführt). Der Header
+// X-Cache-Status ist "hit", "miss" oder "stale"; "stale" bedeutet, dass die
+// FAA nicht erreichbar war (z.B. HTTP 429) und ältere Daten aus dem Cache
+// geliefert wurden.
+//
+// Fehler: HTTP 400 bei ungültigen Parametern, 503 (mit Retry-After) wenn die
+// FAA nicht antwortet und kein alter Cache-Eintrag vorliegt, 500 sonst.
+//
+// Benötigte Umgebungsvariablen: DB_USER, DB_PASS, NMS_AUTH_URL,
+// NMS_CLIENT_ID, NMS_CLIENT_SECRET, NMS_API_BASE.
+
+error_reporting(E_ERROR);
+ini_set('display_errors', 0);
+
+// Nach dieser Zeit wird ein Cache-Eintrag bei der nächsten Anfrage erneuert.
+const CACHE_FRESH_SECONDS = 3600;
+// So lange bleibt ein Eintrag als Notfall-Reserve ("stale") erhalten.
+const CACHE_KEEP_SECONDS = 86400;
+// Nach einem FAA-Fehler wird so lange keine neue FAA-Anfrage für dieselbe
+// Zelle gestellt (Negativ-Cache), damit ein Schwarm von Clients die FAA
+// nicht weiter belastet.
+const NEGATIVE_CACHE_SECONDS = 120;
+// Obergrenze für die Zahl der FAA-Seiten pro Anfrage (Schutz vor
+// Endlosschleifen).
+const MAX_PAGES = 50;
+// Timeout für HTTP-Anfragen an die FAA (pro Seite).
+const HTTP_TIMEOUT_SECONDS = 15;
+// Wartezeit auf das Lock, wenn ein anderer Prozess gerade dieselbe Zelle
+// bei der FAA abfragt.
+const LOCK_WAIT_SECONDS = 20;
+// Maximale Radius-Angabe; die FAA antwortet bei größeren Werten mit HTTP 400.
+const MAX_RADIUS_NM = 100;
+
+/** Fehler der FAA-API (Netzwerk, HTTP-Status, kaputte Antwort). */
+class FaaApiException extends RuntimeException
+{
+    public int $statusCode;
+
+    public function __construct(string $message, int $statusCode = 0)
+    {
+        parent::__construct($message);
+        $this->statusCode = $statusCode;
+    }
+}
+
+/** FAA nicht erreichbar und kein Cache-Eintrag vorhanden → HTTP 503. */
+class ServiceUnavailableException extends RuntimeException
+{
+}
 
 /**
  * Extrahiert den HTTP-Statuscode aus den Response-Headern von
@@ -49,17 +98,35 @@ function getDbConnection() {
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         PDO::ATTR_EMULATE_PREPARES   => false,
     ];
-    try {
-        return new PDO($dsn, $user, $pass, $options);
-    } catch (\PDOException $e) {
-        throw new \PDOException($e->getMessage(), (int)$e->getCode());
-    }
+    return new PDO($dsn, $user, $pass, $options);
+}
+
+// MySQL named locks; the lock name is limited to 64 characters.
+function acquireLock(PDO $pdo, string $name, int $timeout): bool
+{
+    $stmt = $pdo->prepare("SELECT GET_LOCK(?, ?)");
+    $stmt->execute([$name, $timeout]);
+    return $stmt->fetchColumn() == 1;
+}
+
+function releaseLock(PDO $pdo, string $name): void
+{
+    $stmt = $pdo->prepare("SELECT RELEASE_LOCK(?)");
+    $stmt->execute([$name]);
 }
 
 // Function to clean up old cache entries and aggregate metrics
 function performMaintenance($pdo) {
-    // Delete expired cache entries
-    $stmt = $pdo->prepare("DELETE FROM notam_cache WHERE expiration < NOW()");
+    // Delete cache entries that are too old to serve even as stale data.
+    // (expiration = insert time + CACHE_FRESH_SECONDS)
+    $stmt = $pdo->prepare("DELETE FROM notam_cache
+                           WHERE cache_key LIKE 'notam\_%'
+                           AND expiration < DATE_SUB(NOW(), INTERVAL ? SECOND)");
+    $stmt->execute([CACHE_KEEP_SECONDS - CACHE_FRESH_SECONDS]);
+
+    // Delete expired negative-cache entries
+    $stmt = $pdo->prepare("DELETE FROM notam_cache
+                           WHERE cache_key LIKE 'nfail\_%' AND expiration < NOW()");
     $stmt->execute();
 
     // Aggregate metrics older than 30 days
@@ -78,70 +145,138 @@ function performMaintenance($pdo) {
     $stmt->execute();
 }
 
-// Log cache metrics
-function logCacheMetrics($pdo, $isHit) {
-    $metric = $isHit ? 'hit' : 'miss';
-    $stmt = $pdo->prepare("INSERT INTO cache_metrics (metric, count, date) 
-                           VALUES (?, 1, CURDATE())
-                           ON DUPLICATE KEY UPDATE count = count + 1");
-    $stmt->execute([$metric]);
+// Log cache metrics ($metric: 'hit', 'miss' or 'stale'). Metrics are
+// non-essential: failures are logged but never prevent a response.
+function logCacheMetrics($pdo, string $metric) {
+    try {
+        $stmt = $pdo->prepare("INSERT INTO cache_metrics (metric, count, date)
+                               VALUES (?, 1, CURDATE())
+                               ON DUPLICATE KEY UPDATE count = count + 1");
+        $stmt->execute([$metric]);
 
-    // Perform maintenance operations occasionally (e.g., 1% of the time)
-    if (rand(1, 100) == 1) {
-        performMaintenance($pdo);
+        // Perform maintenance operations occasionally (e.g., 1% of the time)
+        if (rand(1, 100) == 1) {
+            performMaintenance($pdo);
+        }
+    } catch (Throwable $e) {
+        error_log("notam.php: metrics/maintenance failed: " . $e->getMessage());
     }
 }
 
-// Function to get cached data or fetch from API
-function getCachedOrFreshData($pdo, $url, $opts, $pageSize, $cacheTime = 3600) {
-    // Generate a unique cache key based on the URL
-    $cacheKey = 'notam_' . md5($url);
-
-    // Try to fetch from cache
-    $stmt = $pdo->prepare("SELECT cache_value FROM notam_cache WHERE cache_key = ? AND expiration > NOW()");
+/**
+ * Liest einen Cache-Eintrag. Gibt null zurück, wenn keiner existiert, sonst
+ * ['value' => string, 'fresh' => bool].
+ */
+function readCache(PDO $pdo, string $cacheKey): ?array
+{
+    $stmt = $pdo->prepare("SELECT cache_value, (expiration > NOW()) AS fresh
+                           FROM notam_cache WHERE cache_key = ?");
     $stmt->execute([$cacheKey]);
-    $result = $stmt->fetch();
-
-    if ($result) {
-        // Data found in cache
-        logCacheMetrics($pdo, true); // Cache hit
-        return $result['cache_value'];
+    $row = $stmt->fetch();
+    if ($row === false) {
+        return null;
     }
+    return ['value' => $row['cache_value'], 'fresh' => (bool)$row['fresh']];
+}
 
-    logCacheMetrics($pdo, false); // Cache miss
-
-    // If not in cache or expired, fetch from API
-    $response = getNotamsFromFaa($url, $opts, $pageSize);
-    if ($response === false) {
-        $error_message = "Failed to get data from FAA API. Status code: $status_code";
-        if ($status_code >= 500) {
-            error_log("Server error when accessing FAA API: $status_code");
-        } elseif ($status_code == 404) {
-            error_log("Resource not found on FAA API: $url");
-        }
-        throw new Exception($error_message);
-    }
-
-    // Store in cache
+function writeCache(PDO $pdo, string $cacheKey, string $value, int $ttlSeconds): void
+{
     $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
                            VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))
                            ON DUPLICATE KEY UPDATE 
                            cache_value = VALUES(cache_value), 
                            expiration = VALUES(expiration)");
-    $stmt->execute([$cacheKey, $response, $cacheTime]);
+    $stmt->execute([$cacheKey, $value, $ttlSeconds]);
+}
 
-    return $response;
+/**
+ * Liefert ['body' => string, 'status' => 'hit'|'miss'|'stale'].
+ *
+ * Ablauf: frischer Cache-Eintrag → hit. Sonst: wenn kürzlich ein FAA-Fehler
+ * für diese Zelle aufgetreten ist (Negativ-Cache), wird ohne FAA-Anfrage der
+ * alte Eintrag geliefert (stale) bzw. 503 geworfen. Sonst wird unter einem
+ * Lock (ein Prozess pro Zelle) die FAA befragt; schlägt das fehl, wird der
+ * Fehler für NEGATIVE_CACHE_SECONDS gemerkt und wie oben verfahren.
+ */
+function getCachedOrFreshData(PDO $pdo, string $url, array $opts): array
+{
+    $hash     = md5($url);
+    $dataKey  = 'notam_' . $hash;   // unchanged from earlier versions
+    $failKey  = 'nfail_' . $hash;
+    $lockName = 'notamlock_' . $hash;
+
+    $cached = readCache($pdo, $dataKey);
+    if ($cached !== null && $cached['fresh']) {
+        logCacheMetrics($pdo, 'hit');
+        return ['body' => $cached['value'], 'status' => 'hit'];
+    }
+
+    $failure = readCache($pdo, $failKey);
+    if ($failure !== null && $failure['fresh']) {
+        return serveStaleOrFail($pdo, $cached, 'FAA API recently failed (negative cache)');
+    }
+
+    if (!acquireLock($pdo, $lockName, LOCK_WAIT_SECONDS)) {
+        // Another process has been querying the FAA for longer than we are
+        // willing to wait.
+        return serveStaleOrFail($pdo, $cached, 'Timeout waiting for concurrent FAA request');
+    }
+
+    try {
+        // Another process may have filled the cache while we waited.
+        $cached = readCache($pdo, $dataKey);
+        if ($cached !== null && $cached['fresh']) {
+            logCacheMetrics($pdo, 'hit');
+            return ['body' => $cached['value'], 'status' => 'hit'];
+        }
+
+        try {
+            $response = getNotamsFromFaa($url, $opts);
+        } catch (FaaApiException $e) {
+            error_log("notam.php: " . $e->getMessage() . " [$url]");
+            writeCache($pdo, $failKey, (string)$e->statusCode, NEGATIVE_CACHE_SECONDS);
+            return serveStaleOrFail($pdo, $cached, $e->getMessage());
+        }
+
+        writeCache($pdo, $dataKey, $response, CACHE_FRESH_SECONDS);
+        logCacheMetrics($pdo, 'miss');
+        return ['body' => $response, 'status' => 'miss'];
+    } finally {
+        releaseLock($pdo, $lockName);
+    }
+}
+
+function serveStaleOrFail(PDO $pdo, ?array $cached, string $reason): array
+{
+    if ($cached !== null) {
+        logCacheMetrics($pdo, 'stale');
+        return ['body' => $cached['value'], 'status' => 'stale'];
+    }
+    throw new ServiceUnavailableException($reason);
 }
 
 function getToken(PDO $pdo): string
 {
     $row = fetchTokenFromCache($pdo);
-
     if ($row !== null && isTokenStillValid($row['expires_at'])) {
         return $row['access_token'];
     }
 
-    return getTokenFromFaa($pdo);
+    // Only one process renews the token; the others wait and re-read it.
+    $locked = acquireLock($pdo, 'nms_token', LOCK_WAIT_SECONDS);
+    try {
+        if ($locked) {
+            $row = fetchTokenFromCache($pdo);
+            if ($row !== null && isTokenStillValid($row['expires_at'])) {
+                return $row['access_token'];
+            }
+        }
+        return getTokenFromFaa($pdo);
+    } finally {
+        if ($locked) {
+            releaseLock($pdo, 'nms_token');
+        }
+    }
 }
 
 function fetchTokenFromCache(PDO $pdo): ?array
@@ -194,21 +329,21 @@ function getTokenFromFaa($pdo): string
     $raw = @file_get_contents($authUrl, false, $context);
 
     if ($raw === false) {
-        throw new \RuntimeException('Netzwerkfehler beim Abrufen des Bearer-Tokens.');
+        throw new FaaApiException('Netzwerkfehler beim Abrufen des Bearer-Tokens.');
     }
 
     $statusCode = extractHttpStatusCode($http_response_header ?? []);
 
     if ($statusCode < 200 || $statusCode >= 300) {
-        throw new \RuntimeException(
-            "Auth-Endpunkt antwortete mit HTTP {$statusCode}."
+        throw new FaaApiException(
+            "Auth-Endpunkt antwortete mit HTTP {$statusCode}.", $statusCode
         );
     }
 
     $data = json_decode($raw, true);
 
     if (json_last_error() !== JSON_ERROR_NONE || empty($data['access_token'])) {
-        throw new \RuntimeException(
+        throw new FaaApiException(
             'Ungültige Auth-Antwort: kein access_token erhalten.'
         );
     }
@@ -217,7 +352,6 @@ function getTokenFromFaa($pdo): string
     $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
         ->modify("+{$expiresIn} seconds")
         ->format('Y-m-d H:i:s');
-    $updatedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
     $stmt = $pdo->prepare(
         "INSERT INTO nms_token_cache (id, access_token, expires_at, updated_at)
@@ -234,153 +368,140 @@ function getTokenFromFaa($pdo): string
     return $data['access_token'];
 }
 
-function getNotamsFromFaa($url, $opts, $pageSize) {
+/**
+ * Fragt alle Seiten der FAA-Antwort ab und führt sie zu einem JSON-String
+ * zusammen. Wirft FaaApiException bei jedem Fehler.
+ */
+function getNotamsFromFaa(string $url, array $opts): string
+{
     $allItems = [];
-    $pageNum = 1;
-    $hasMorePages = true;
+    $context = stream_context_create($opts);
 
-    while ($hasMorePages) {
+    for ($pageNum = 1; $pageNum <= MAX_PAGES; $pageNum++) {
         $paginatedUrl = $url . '&pageNum=' . $pageNum;
 
-        // Make the request
-        $context = stream_context_create($opts);
         $response = @file_get_contents($paginatedUrl, false, $context);
+        $statusCode = extractHttpStatusCode($http_response_header ?? []);
 
-        // Get the status code
-        $status_code = 0;
-        if (isset($http_response_header[0])) {
-            preg_match('/\d{3}/', $http_response_header[0], $matches);
-            $status_code = intval($matches[0]);
+        if ($response === false || $statusCode < 200 || $statusCode >= 300) {
+            throw new FaaApiException(
+                "Failed to get data from FAA API. Status code: $statusCode", $statusCode
+            );
         }
 
-        // Handle any error in the response
-        if ($response === false || $status_code < 200 || $status_code >= 300) {
-            $error_message = "Failed to get data from FAA API. Status code: $status_code";
-            if ($status_code >= 500) {
-                error_log("Server error when accessing FAA API: $status_code");
-            } elseif ($status_code == 404) {
-                error_log("Resource not found on FAA API: $paginatedUrl");
-            }
-            throw new Exception($error_message);
-        }
-
-        // Decode the JSON response
         $data = json_decode($response, true);
-        if ($data === null) {
-            throw new Exception("Failed to decode JSON response from FAA API");
+        if (!is_array($data)) {
+            throw new FaaApiException("Failed to decode JSON response from FAA API (page $pageNum)");
         }
 
-        // Append the items to the allItems array
-        if (isset($data['data'])) {
-            if (isset($data['data']['geojson'])) {
-                $allItems = array_merge($allItems, $data['data']['geojson']);
-            }
+        if (isset($data['data']['geojson']) && is_array($data['data']['geojson'])) {
+            $allItems = array_merge($allItems, $data['data']['geojson']);
         }
 
-        // Check if there are more pages
-        if (isset($data['pageNum']) && isset($data['totalPages'])) {
-            $hasMorePages = $data['pageNum'] < $data['totalPages'];
-            $pageNum++; // Move to the next page
-        } else {
-            // If the pagination info is missing, stop the loop
-            $hasMorePages = false;
+        // Stop when this was the last page (or pagination info is missing).
+        // The local counter is used on purpose: relying on the pageNum echoed
+        // by the FAA could loop forever if the FAA ignores the parameter.
+        if (!isset($data['totalPages']) || $pageNum >= (int)$data['totalPages']) {
+            break;
+        }
+        if ($pageNum == MAX_PAGES) {
+            error_log("notam.php: page limit of " . MAX_PAGES . " reached for $url; result truncated");
         }
     }
 
     // Construct the final response
     $finalResponse = [
-        'pageSize' => $pageSize,
+        'pageSize' => sizeof($allItems),
         'pageNum' => 1, // Since we're combining all pages, set the current page to 1
         'totalCount' => sizeof($allItems),
         'totalPages' => 1, // Since all data is combined into one response, totalPages is 1
         'items' => $allItems
     ];
-    return json_encode($finalResponse);
+    $json = json_encode($finalResponse, JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($json === false) {
+        throw new FaaApiException("Failed to encode merged response: " . json_last_error_msg());
+    }
+    return $json;
 }
 
 function isValidLatitude($input) {
-    // Validate latitude and longitude ranges
-    if (isValidDegree($input) && $input >= -90 && $input <= 90) {
-        return true;
-    } else {
-        return false;
-    }
+    return isValidDegree($input) && $input >= -90 && $input <= 90;
 }
 
 function isValidLongitude($input) {
-    // Validate latitude and longitude ranges
-    if (isValidDegree($input) && $input >= -180 && $input <= 180) {
-        return true;
-    } else {
-        return false;
-    }
+    return isValidDegree($input) && $input >= -180 && $input <= 180;
 }
 
 function isValidDegree($input) {
-    // Define the regular expression pattern for latitude and longitude
-    $pattern = '/^(-?\d+(\.\d+)?)$/';
-
-    // Use preg_match to check if the input string matches the pattern
-    return preg_match($pattern, $input) === 1;
+    // Plain decimal number, e.g. "7", "-7.25"; no exponent notation
+    return preg_match('/^(-?\d+(\.\d+)?)$/', (string)$input) === 1;
 }
 
 function isValidRadius($input) {
-    // Check if input is numeric and within the range
-    return is_numeric($input) && $input > 0 && $input < 500 && intval($input) == $input;
+    return is_numeric($input) && $input > 0 && $input <= MAX_RADIUS_NM && intval($input) == $input;
 }
 
-function isValidPageSize($input) {
-    // Check if input is numeric and within the range
-    return is_numeric($input) && $input > 0 && $input <= 1000 && intval($input) == $input;
+/** Maps an exception to the HTTP status and the message sent to the client. */
+function errorResponse(Throwable $e): array
+{
+    if ($e instanceof InvalidArgumentException) {
+        return [400, $e->getMessage()];
+    }
+    if ($e instanceof ServiceUnavailableException) {
+        header('Retry-After: ' . NEGATIVE_CACHE_SECONDS);
+        return [503, 'FAA NOTAM service temporarily unavailable'];
+    }
+    // Anything else (DB, configuration, token, ...): do not expose internals.
+    return [500, 'Internal server error'];
 }
 
 try {
-    // Input validation and sanitization
-    $longitude = filter_input(INPUT_GET, 'locationLongitude', FILTER_VALIDATE_FLOAT);
-    $latitude = filter_input(INPUT_GET, 'locationLatitude', FILTER_VALIDATE_FLOAT);
-    $radius = filter_input(INPUT_GET, 'locationRadius', FILTER_VALIDATE_INT);
-    $pageSize = filter_input(INPUT_GET, 'pageSize', FILTER_VALIDATE_INT) ?: 1000;
+    // Input validation and sanitization. Raw strings are validated by regex,
+    // so that the values can be passed to the FAA verbatim.
+    $longitude = $_GET['locationLongitude'] ?? null;
+    $latitude  = $_GET['locationLatitude'] ?? null;
+    $radius    = $_GET['locationRadius'] ?? null;
 
-    if (!isset($latitude) || !isset($longitude) || !$radius || !isValidLongitude($longitude) || !isValidLatitude($latitude) || !isValidRadius($radius) || !isValidPageSize($pageSize)) {
-      throw new InvalidArgumentException("Invalid input parameters");
+    if (!is_string($longitude) || !is_string($latitude) || !is_string($radius)
+        || !isValidLongitude($longitude) || !isValidLatitude($latitude)) {
+        throw new InvalidArgumentException("Invalid input parameters: locationLongitude, locationLatitude and locationRadius are required");
+    }
+    if (!isValidRadius($radius)) {
+        throw new InvalidArgumentException("Invalid locationRadius: must be an integer between 1 and " . MAX_RADIUS_NM . " (nautical miles)");
+    }
+
+    $apiBase = getenv('NMS_API_BASE');
+    if (!$apiBase) {
+        throw new \RuntimeException('NMS-Umgebungsvariable NMS_API_BASE fehlt.');
     }
 
     // Build request
-    $url = getenv('NMS_API_BASE') . '/notams?'
+    $url = $apiBase . '/notams?'
     . 'longitude=' . $longitude
     . '&latitude=' . $latitude
-    . '&radius='   . $radius;
+    . '&radius='   . (int)$radius;
 
     $pdo = getDbConnection();
     $token = getToken($pdo);
-    $opts = ['http' => ['header' => [
-        "Authorization: Bearer $token",
-        "nmsResponseFormat: geojson"
-    ]]];
+    $opts = ['http' => [
+        'header' => [
+            "Authorization: Bearer $token",
+            "nmsResponseFormat: geojson"
+        ],
+        'timeout'       => HTTP_TIMEOUT_SECONDS,
+        'ignore_errors' => true,
+    ]];
 
-    // Get Data from FAA API (without caching, for testing purposes)
-    /*
-    $response = getNotamsFromFaa($url, $opts, $pageSize);
-    if ($response === false) {
-        throw new Exception("Failed to get NOTAM data from FAA API");
-    }
-    */
+    $result = getCachedOrFreshData($pdo, $url, $opts);
 
-    // Get data (cached or fresh)
-    $response = getCachedOrFreshData($pdo, $url, $opts, $pageSize);
-    if ($response === false) {
-        throw new Exception("Failed to get NOTAM data from FAA API");
-    }
-
-    // Return data
     header('Content-Type: application/json');
-    echo $response;
+    header('X-Cache-Status: ' . $result['status']);
+    echo $result['body'];
 
-} catch (Exception $e) {
-    http_response_code(500);
-    echo json_encode(["error" => $e->getMessage()]);
-    // Log the error
-    error_log($e->getMessage());
+} catch (Throwable $e) {
+    error_log("notam.php: " . get_class($e) . ": " . $e->getMessage());
+    [$status, $message] = errorResponse($e);
+    http_response_code($status);
+    header('Content-Type: application/json');
+    echo json_encode(["error" => $message]);
 }
-
-?>

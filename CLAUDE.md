@@ -8,8 +8,8 @@ Proxy scripts for **Enroute Flight Navigation**. They run on the Akaflieg Freibu
 
 ## Endpoints
 
-- **metar.php** and **taf.php** — near-identical twins (keep them in sync when changing one). They download the full aviationweather.gov cache file (`metars.cache.xml.gz` / `tafs.cache.xml.gz`), store per-station rows in MySQL, and answer bounding-box queries (`?format=xml&bbox=minLon,minLat,maxLon,maxLat`) with XML matching the aviationweather.gov schema. Cache TTL is 5 minutes; tables are auto-created.
-- **notam.php** — proxies the FAA NOTAM Management Service (NMS) API. Flow: obtain an OAuth client-credentials bearer token (cached in the `nms_token_cache` DB table, renewed 60 s before expiry) → query `NMS_API_BASE/notams` for a lat/lon/radius, following pagination and merging all pages into a single geojson response → cache the merged response in `notam_cache` for 1 hour. Also records hit/miss counts in `cache_metrics` and occasionally (1% of requests) aggregates them into `cache_metrics_monthly` and purges expired cache rows. Unlike metar/taf, its tables are *not* auto-created. Comments are partly in German.
+- **metar.php** and **taf.php** — near-identical twins (keep them in sync when changing one). They download the full aviationweather.gov cache file (`metars.cache.xml.gz` / `tafs.cache.xml.gz`), store per-station rows in MySQL, and answer bounding-box queries (`?format=xml&bbox=minLat,minLon,maxLat,maxLon`) with XML matching the aviationweather.gov schema. Cache TTL is 5 minutes; tables are auto-created.
+- **notam.php** — proxies the FAA NOTAM Management Service (NMS) API. Flow: obtain an OAuth client-credentials bearer token (cached in the `nms_token_cache` DB table, renewed 60 s before expiry, refreshed under a MySQL named lock) → query `NMS_API_BASE/notams` for a lat/lon/radius, following pagination (max 50 pages) and merging all pages into a single geojson response → cache the merged response in `notam_cache` (key `notam_<md5(url)>`) for 1 hour, keeping rows 24 h as a stale fallback. Only one process per query talks to the FAA (`GET_LOCK`). On FAA failure (notably HTTP 429, whose limit is shared by all clients) a negative-cache row `nfail_<md5>` suppresses FAA requests for 2 minutes, stale data is served with `X-Cache-Status: stale`, or `503` + `Retry-After` if there is none. Bad input gives `400`; other errors `500` with a generic message. Also records hit/miss/stale counts in `cache_metrics` (non-fatal) and occasionally (1% of requests) aggregates them into `cache_metrics_monthly` and purges old cache rows. Unlike metar/taf, its tables are *not* auto-created. Comments are partly in German.
 
 All three share the MySQL database `enroutecaches` on host `sql731.your-server.de` (hardcoded).
 
@@ -19,8 +19,6 @@ All credentials come from environment variables, set in production via Apache `S
 
 - `DB_USER`, `DB_PASS` — MySQL credentials (all scripts)
 - `NMS_AUTH_URL`, `NMS_CLIENT_ID`, `NMS_CLIENT_SECRET`, `NMS_API_BASE` — FAA NMS API (notam.php only)
-
-The README's mention of `FAA_ID`/`FAA_KEY` is outdated; the code uses the `NMS_*` variables.
 
 ## Running and testing
 
