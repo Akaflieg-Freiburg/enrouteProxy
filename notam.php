@@ -1,56 +1,45 @@
 <?php
 
-// Dieses Skript liest NOTAMs über die NOTAM Management Service (NMS) API der
-// Federal Aviation Administration (FAA) der USA ein und gibt sie aus.
+// Proxy for the NOTAM Management Service (NMS) API of the US Federal Aviation
+// Administration (FAA), used by Enroute Flight Navigation.
 //
-// Kontakt: Markus Sachs, ms@squawk-vfr.de
-// Geschrieben für Enroute Flight Navigation im Jan. 2024.
+// Originally written for Enroute Flight Navigation by Markus Sachs
+// (ms@squawk-vfr.de) in January 2024. Data source: https://www.faa.gov/
 //
-// Weitergehende Informationen über die Datenquelle:
-// https://www.faa.gov/
+// Usage: notam.php?locationLongitude=<deg>&locationLatitude=<deg>&locationRadius=<NM>
 //
-// Aufruf: [Server/htdocs]/notam.php?locationLongitude=a&locationLatitude=b&locationRadius=c
-// mit
-// a = Längengrad (Punkt als Dezimaltrenner) des Zentrums der Suche
-// b = Breitengrad (Punkt als Dezimaltrenner) des Zentrums der Suche
-// c = Radius der Suche in Nautischen Meilen (ganzzahlig, 1 bis 100;
-//     die FAA lehnt größere Werte ab)
-//
-// Antwort: JSON mit den Feldern pageSize, pageNum, totalCount, totalPages und
-// items (alle Seiten der FAA-Antwort zusammengeführt). Der Header
-// X-Cache-Status ist "hit", "miss" oder "stale"; "stale" bedeutet, dass die
-// FAA nicht erreichbar war (z.B. HTTP 429) und ältere Daten aus dem Cache
-// geliefert wurden.
-//
-// Fehler: HTTP 400 bei ungültigen Parametern, 503 (mit Retry-After) wenn die
-// FAA nicht antwortet und kein alter Cache-Eintrag vorliegt, 500 sonst.
-//
-// Benötigte Umgebungsvariablen: DB_USER, DB_PASS, NMS_AUTH_URL,
-// NMS_CLIENT_ID, NMS_CLIENT_SECRET, NMS_API_BASE.
+// Parameters, response format, error codes, caching and configuration are
+// documented in README.md; the database schema is in notam.sql.
 
 error_reporting(E_ERROR);
 ini_set('display_errors', 0);
 
-// Nach dieser Zeit wird ein Cache-Eintrag bei der nächsten Anfrage erneuert.
+// After this time, a cache entry is renewed on the next request.
 const CACHE_FRESH_SECONDS = 3600;
-// So lange bleibt ein Eintrag als Notfall-Reserve ("stale") erhalten.
+// Entries are kept this long as a fallback ("stale") for when the FAA fails.
 const CACHE_KEEP_SECONDS = 86400;
-// Nach einem FAA-Fehler wird so lange keine neue FAA-Anfrage für dieselbe
-// Zelle gestellt (Negativ-Cache), damit ein Schwarm von Clients die FAA
-// nicht weiter belastet.
+// After an FAA failure, no new FAA request is made for the same query for
+// this long (negative cache), so that a swarm of clients does not add to the
+// load on the FAA.
 const NEGATIVE_CACHE_SECONDS = 120;
-// Obergrenze für die Zahl der FAA-Seiten pro Anfrage (Schutz vor
-// Endlosschleifen).
+// Upper limit for the number of FAA pages per request (protection against
+// endless loops).
 const MAX_PAGES = 50;
-// Timeout für HTTP-Anfragen an die FAA (pro Seite).
+// Timeout for HTTP requests to the FAA (per page).
 const HTTP_TIMEOUT_SECONDS = 15;
-// Wartezeit auf das Lock, wenn ein anderer Prozess gerade dieselbe Zelle
-// bei der FAA abfragt.
+// How long to wait for the lock while another process is querying the FAA
+// for the same query.
 const LOCK_WAIT_SECONDS = 20;
-// Maximale Radius-Angabe; die FAA antwortet bei größeren Werten mit HTTP 400.
+// Maximum radius; the FAA answers larger values with HTTP 400.
 const MAX_RADIUS_NM = 100;
+// The cached bearer token is renewed this long before it expires.
+const TOKEN_RENEWAL_BUFFER_SECONDS = 60;
+// Timeout for the HTTP request to the FAA auth endpoint.
+const TOKEN_HTTP_TIMEOUT_SECONDS = 10;
+// Token lifetime assumed if the auth endpoint does not send expires_in.
+const DEFAULT_TOKEN_LIFETIME_SECONDS = 1799;
 
-/** Fehler der FAA-API (Netzwerk, HTTP-Status, kaputte Antwort). */
+/** Error from the FAA API (network, HTTP status, malformed response). */
 class FaaApiException extends RuntimeException
 {
     public int $statusCode;
@@ -62,7 +51,7 @@ class FaaApiException extends RuntimeException
     }
 }
 
-/** FAA nicht erreichbar und kein Cache-Eintrag vorhanden → HTTP 503. */
+/** FAA unreachable and no cache entry available → HTTP 503. */
 class ServiceUnavailableException extends RuntimeException
 {
 }
@@ -84,8 +73,9 @@ function extractHttpStatusCode(array $responseHeaders): int
     return isset($matches[1]) ? (int)$matches[1] : 0;
 }
 
-// Function to get database connection
-function getDbConnection() {
+/** Opens the connection to the cache database. */
+function getDbConnection(): PDO
+{
     $host = 'sql731.your-server.de';
     $db   = 'enroutecaches';
     $user = getenv('DB_USER');
@@ -101,7 +91,10 @@ function getDbConnection() {
     return new PDO($dsn, $user, $pass, $options);
 }
 
-// MySQL named locks; the lock name is limited to 64 characters.
+/**
+ * Acquires a MySQL named lock, waiting up to $timeout seconds. Lock names are
+ * limited to 64 characters.
+ */
 function acquireLock(PDO $pdo, string $name, int $timeout): bool
 {
     $stmt = $pdo->prepare("SELECT GET_LOCK(?, ?)");
@@ -109,14 +102,16 @@ function acquireLock(PDO $pdo, string $name, int $timeout): bool
     return $stmt->fetchColumn() == 1;
 }
 
+/** Releases a lock acquired with acquireLock(). */
 function releaseLock(PDO $pdo, string $name): void
 {
     $stmt = $pdo->prepare("SELECT RELEASE_LOCK(?)");
     $stmt->execute([$name]);
 }
 
-// Function to clean up old cache entries and aggregate metrics
-function performMaintenance($pdo) {
+/** Deletes old cache entries and aggregates old daily metrics into monthly ones. */
+function performMaintenance(PDO $pdo): void
+{
     // Delete cache entries that are too old to serve even as stale data.
     // (expiration = insert time + CACHE_FRESH_SECONDS)
     $stmt = $pdo->prepare("DELETE FROM notam_cache
@@ -145,9 +140,13 @@ function performMaintenance($pdo) {
     $stmt->execute();
 }
 
-// Log cache metrics ($metric: 'hit', 'miss' or 'stale'). Metrics are
-// non-essential: failures are logged but never prevent a response.
-function logCacheMetrics($pdo, string $metric) {
+/**
+ * Counts a cache event ($metric: 'hit', 'miss' or 'stale') and occasionally
+ * runs performMaintenance(). Metrics are non-essential: failures are logged
+ * but never prevent a response.
+ */
+function logCacheMetrics(PDO $pdo, string $metric): void
+{
     try {
         $stmt = $pdo->prepare("INSERT INTO cache_metrics (metric, count, date)
                                VALUES (?, 1, CURDATE())
@@ -164,7 +163,7 @@ function logCacheMetrics($pdo, string $metric) {
 }
 
 /**
- * Liest einen Cache-Eintrag. Gibt null zurück, wenn keiner existiert, sonst
+ * Reads a cache entry. Returns null if there is none, otherwise
  * ['value' => string, 'fresh' => bool].
  */
 function readCache(PDO $pdo, string $cacheKey): ?array
@@ -179,6 +178,7 @@ function readCache(PDO $pdo, string $cacheKey): ?array
     return ['value' => $row['cache_value'], 'fresh' => (bool)$row['fresh']];
 }
 
+/** Inserts or replaces a cache entry that stays fresh for $ttlSeconds. */
 function writeCache(PDO $pdo, string $cacheKey, string $value, int $ttlSeconds): void
 {
     $stmt = $pdo->prepare("INSERT INTO notam_cache (cache_key, cache_value, expiration) 
@@ -190,18 +190,19 @@ function writeCache(PDO $pdo, string $cacheKey, string $value, int $ttlSeconds):
 }
 
 /**
- * Liefert ['body' => string, 'status' => 'hit'|'miss'|'stale'].
+ * Returns ['body' => string, 'status' => 'hit'|'miss'|'stale'].
  *
- * Ablauf: frischer Cache-Eintrag → hit. Sonst: wenn kürzlich ein FAA-Fehler
- * für diese Zelle aufgetreten ist (Negativ-Cache), wird ohne FAA-Anfrage der
- * alte Eintrag geliefert (stale) bzw. 503 geworfen. Sonst wird unter einem
- * Lock (ein Prozess pro Zelle) die FAA befragt; schlägt das fehl, wird der
- * Fehler für NEGATIVE_CACHE_SECONDS gemerkt und wie oben verfahren.
+ * Flow: a fresh cache entry is a hit. Otherwise, if an FAA request for this
+ * query failed recently (negative cache), the old entry is served as stale
+ * without asking the FAA, or ServiceUnavailableException (503) is thrown if
+ * there is none. Otherwise the FAA is queried under a lock (one process per
+ * query); if that fails, the failure is remembered for NEGATIVE_CACHE_SECONDS
+ * and handled as above.
  */
 function getCachedOrFreshData(PDO $pdo, string $url, array $opts): array
 {
     $hash     = md5($url);
-    $dataKey  = 'notam_' . $hash;   // unchanged from earlier versions
+    $dataKey  = 'notam_' . $hash;   // format kept from earlier versions, so existing rows stay valid
     $failKey  = 'nfail_' . $hash;
     $lockName = 'notamlock_' . $hash;
 
@@ -246,6 +247,10 @@ function getCachedOrFreshData(PDO $pdo, string $url, array $opts): array
     }
 }
 
+/**
+ * Serves the cache entry as stale data, or throws ServiceUnavailableException
+ * if there is none.
+ */
 function serveStaleOrFail(PDO $pdo, ?array $cached, string $reason): array
 {
     if ($cached !== null) {
@@ -255,6 +260,10 @@ function serveStaleOrFail(PDO $pdo, ?array $cached, string $reason): array
     throw new ServiceUnavailableException($reason);
 }
 
+/**
+ * Returns a bearer token for the NMS API: the cached one if it is still
+ * valid, otherwise a new one from the FAA.
+ */
 function getToken(PDO $pdo): string
 {
     $row = fetchTokenFromCache($pdo);
@@ -289,27 +298,31 @@ function fetchTokenFromCache(PDO $pdo): ?array
     return $row !== false ? $row : null;
 }
 
+/** $expiresAt is a UTC timestamp as stored in nms_token_cache. */
 function isTokenStillValid(string $expiresAt): bool
 {
-    $TOKEN_RENEWAL_BUFFER_SECONDS = 60;
-    $utc = new \DateTimeZone('UTC');
+    $utc = new DateTimeZone('UTC');
 
-    $threshold   = new \DateTimeImmutable('now', $utc);
-    $threshold   = $threshold->modify('+' . $TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds');
-    $tokenExpiry = new \DateTimeImmutable($expiresAt, $utc);
+    $threshold   = new DateTimeImmutable('now', $utc);
+    $threshold   = $threshold->modify('+' . TOKEN_RENEWAL_BUFFER_SECONDS . ' seconds');
+    $tokenExpiry = new DateTimeImmutable($expiresAt, $utc);
 
     return $threshold < $tokenExpiry;
 }
 
-function getTokenFromFaa($pdo): string
+/**
+ * Fetches a new bearer token from the FAA auth endpoint (OAuth client
+ * credentials) and stores it in nms_token_cache.
+ */
+function getTokenFromFaa(PDO $pdo): string
 {
     $authUrl      = getenv('NMS_AUTH_URL');
     $clientId     = getenv('NMS_CLIENT_ID');
     $clientSecret = getenv('NMS_CLIENT_SECRET');
 
     if (!$authUrl || !$clientId || !$clientSecret) {
-        throw new \RuntimeException(
-            'NMS-Umgebungsvariablen (NMS_AUTH_URL, NMS_CLIENT_ID, NMS_CLIENT_SECRET) fehlen.'
+        throw new RuntimeException(
+            'NMS environment variables (NMS_AUTH_URL, NMS_CLIENT_ID, NMS_CLIENT_SECRET) are missing.'
         );
     }
 
@@ -321,7 +334,7 @@ function getTokenFromFaa($pdo): string
                 'Authorization: Basic ' . base64_encode("{$clientId}:{$clientSecret}"),
             ],
             'content'       => 'grant_type=client_credentials',
-            'timeout'       => 10,
+            'timeout'       => TOKEN_HTTP_TIMEOUT_SECONDS,
             'ignore_errors' => true,
         ],
     ]);
@@ -329,14 +342,14 @@ function getTokenFromFaa($pdo): string
     $raw = @file_get_contents($authUrl, false, $context);
 
     if ($raw === false) {
-        throw new FaaApiException('Netzwerkfehler beim Abrufen des Bearer-Tokens.');
+        throw new FaaApiException('Network error while fetching the bearer token.');
     }
 
     $statusCode = extractHttpStatusCode($http_response_header ?? []);
 
     if ($statusCode < 200 || $statusCode >= 300) {
         throw new FaaApiException(
-            "Auth-Endpunkt antwortete mit HTTP {$statusCode}.", $statusCode
+            "Auth endpoint answered with HTTP {$statusCode}.", $statusCode
         );
     }
 
@@ -344,12 +357,12 @@ function getTokenFromFaa($pdo): string
 
     if (json_last_error() !== JSON_ERROR_NONE || empty($data['access_token'])) {
         throw new FaaApiException(
-            'Ungültige Auth-Antwort: kein access_token erhalten.'
+            'Invalid auth response: no access_token received.'
         );
     }
 
-    $expiresIn = (int)($data['expires_in'] ?? 1799);
-    $expiresAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+    $expiresIn = (int)($data['expires_in'] ?? DEFAULT_TOKEN_LIFETIME_SECONDS);
+    $expiresAt = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
         ->modify("+{$expiresIn} seconds")
         ->format('Y-m-d H:i:s');
 
@@ -369,8 +382,8 @@ function getTokenFromFaa($pdo): string
 }
 
 /**
- * Fragt alle Seiten der FAA-Antwort ab und führt sie zu einem JSON-String
- * zusammen. Wirft FaaApiException bei jedem Fehler.
+ * Fetches all pages of the FAA response and merges them into one JSON string.
+ * Throws FaaApiException on any error.
  */
 function getNotamsFromFaa(string $url, array $opts): string
 {
@@ -410,10 +423,11 @@ function getNotamsFromFaa(string $url, array $opts): string
     }
 
     // Construct the final response
+    $itemCount = count($allItems);
     $finalResponse = [
-        'pageSize' => sizeof($allItems),
+        'pageSize' => $itemCount,
         'pageNum' => 1, // Since we're combining all pages, set the current page to 1
-        'totalCount' => sizeof($allItems),
+        'totalCount' => $itemCount,
         'totalPages' => 1, // Since all data is combined into one response, totalPages is 1
         'items' => $allItems
     ];
@@ -424,20 +438,24 @@ function getNotamsFromFaa(string $url, array $opts): string
     return $json;
 }
 
-function isValidLatitude($input) {
+function isValidLatitude(string $input): bool
+{
     return isValidDegree($input) && $input >= -90 && $input <= 90;
 }
 
-function isValidLongitude($input) {
+function isValidLongitude(string $input): bool
+{
     return isValidDegree($input) && $input >= -180 && $input <= 180;
 }
 
-function isValidDegree($input) {
+function isValidDegree(string $input): bool
+{
     // Plain decimal number, e.g. "7", "-7.25"; no exponent notation
-    return preg_match('/^(-?\d+(\.\d+)?)$/', (string)$input) === 1;
+    return preg_match('/^(-?\d+(\.\d+)?)$/', $input) === 1;
 }
 
-function isValidRadius($input) {
+function isValidRadius(string $input): bool
+{
     return is_numeric($input) && $input > 0 && $input <= MAX_RADIUS_NM && intval($input) == $input;
 }
 
@@ -448,7 +466,6 @@ function errorResponse(Throwable $e): array
         return [400, $e->getMessage()];
     }
     if ($e instanceof ServiceUnavailableException) {
-        header('Retry-After: ' . NEGATIVE_CACHE_SECONDS);
         return [503, 'FAA NOTAM service temporarily unavailable'];
     }
     // Anything else (DB, configuration, token, ...): do not expose internals.
@@ -472,7 +489,7 @@ try {
 
     $apiBase = getenv('NMS_API_BASE');
     if (!$apiBase) {
-        throw new \RuntimeException('NMS-Umgebungsvariable NMS_API_BASE fehlt.');
+        throw new RuntimeException('NMS environment variable NMS_API_BASE is missing.');
     }
 
     // Build request
@@ -502,6 +519,9 @@ try {
     error_log("notam.php: " . get_class($e) . ": " . $e->getMessage());
     [$status, $message] = errorResponse($e);
     http_response_code($status);
+    if ($status == 503) {
+        header('Retry-After: ' . NEGATIVE_CACHE_SECONDS);
+    }
     header('Content-Type: application/json');
     echo json_encode(["error" => $message]);
 }
