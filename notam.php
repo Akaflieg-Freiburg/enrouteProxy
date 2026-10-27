@@ -36,8 +36,15 @@ const HTTP_TIMEOUT_SECONDS = 15;
 // holding the query lock (and a PHP worker) for minutes.
 const FETCH_DEADLINE_SECONDS = 30;
 // How long to wait for the lock while another process is querying the FAA
-// for the same query (or renewing the token).
+// for the same query (or renewing the token), and for a free FAA slot.
 const LOCK_WAIT_SECONDS = 20;
+// Maximum number of FAA requests in flight at the same time from this server.
+// The FAA answers further parallel requests with HTTP 429 (observed limit: 2),
+// which would lock everyone out for NEGATIVE_CACHE_SECONDS. Requests beyond
+// this number queue for a slot instead.
+const FAA_MAX_CONCURRENT = 2;
+// Pause between two attempts to grab a free FAA slot.
+const FAA_SLOT_POLL_MICROSECONDS = 200000;
 // Maximum radius; the FAA answers larger values with HTTP 400.
 const MAX_RADIUS_NM = 100;
 // The cached bearer token is renewed this long before it expires.
@@ -141,6 +148,28 @@ function releaseLock(PDO $pdo, string $name): void
 {
     $stmt = $pdo->prepare("SELECT RELEASE_LOCK(?)");
     $stmt->execute([$name]);
+}
+
+/**
+ * Takes one of the FAA_MAX_CONCURRENT slots for talking to the FAA (a
+ * semaphore made of MySQL named locks 'notam_faa_slot_<n>'), waiting up to
+ * $timeout seconds. Returns the lock name to release, or null on timeout.
+ */
+function acquireFaaSlot(PDO $pdo, int $timeout): ?string
+{
+    $deadline = microtime(true) + $timeout;
+    while (true) {
+        for ($i = 0; $i < FAA_MAX_CONCURRENT; $i++) {
+            $name = 'notam_faa_slot_' . $i;
+            if (acquireLock($pdo, $name, 0)) {
+                return $name;
+            }
+        }
+        if (microtime(true) >= $deadline) {
+            return null;
+        }
+        usleep(FAA_SLOT_POLL_MICROSECONDS);
+    }
 }
 
 /**
@@ -288,8 +317,9 @@ function recordFaaFailure(PDO $pdo, string $failKey, FaaApiException $e): void
  * cooldown after a rate limit or token failure, or a recent failure of this
  * query), the old entry is served as stale without asking the FAA, or
  * ServiceUnavailableException (503) is thrown if there is none. Otherwise the
- * FAA is queried under a lock (one process per query); if that fails, the
- * failure is remembered and handled as above.
+ * FAA is queried under a lock (one process per query) and within one of the
+ * FAA_MAX_CONCURRENT slots shared by all queries; if that fails, the failure
+ * is remembered and handled as above.
  */
 function getCachedOrFreshData(PDO $pdo, string $url): array
 {
@@ -328,12 +358,19 @@ function getCachedOrFreshData(PDO $pdo, string $url): array
             return serveStaleOrFail($pdo, $cached, $blocked);
         }
 
+        // Limit the number of parallel FAA requests from this server.
+        $slot = acquireFaaSlot($pdo, LOCK_WAIT_SECONDS);
+        if ($slot === null) {
+            return serveStaleOrFail($pdo, $cached, 'Timeout waiting for a free FAA slot');
+        }
         try {
             $response = fetchNotams($pdo, $url);
         } catch (FaaApiException $e) {
             error_log("notam.php: " . $e->getMessage() . " [$url]");
             recordFaaFailure($pdo, $failKey, $e);
             return serveStaleOrFail($pdo, $cached, $e->getMessage());
+        } finally {
+            releaseLock($pdo, $slot);
         }
 
         // A good FAA answer is returned even if the cache cannot store it.
