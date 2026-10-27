@@ -77,7 +77,11 @@ Errors come with the JSON body `{"error": "<message>"}`.
   (MySQL locks `notam_faa_slot_<n>`), because the FAA answers further
   parallel requests with HTTP 429 (observed 2026-10). Requests for different
   queries queue for a free slot for up to 20 s; a request that gets none is
-  served `stale` or `503` without the FAA having failed.
+  served `stale` or `503` without the FAA having failed. A slot is held for
+  0.5 s after the FAA has answered, because the FAA still counts a finished
+  request for a moment. A single HTTP 429 is retried once after 1 s while
+  the slot is held (unless the FAA asks for a longer wait via `Retry-After`);
+  only a second 429 counts as a rate limit.
 - A fetch must finish within 30 s in total (all pages) and at most 50 pages
   are read; otherwise it counts as an FAA failure. The current NMS API
   answers everything on one page and ignores `pageNum`.

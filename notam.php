@@ -45,6 +45,16 @@ const LOCK_WAIT_SECONDS = 20;
 const FAA_MAX_CONCURRENT = 2;
 // Pause between two attempts to grab a free FAA slot.
 const FAA_SLOT_POLL_MICROSECONDS = 200000;
+// A slot is held this long after the FAA has answered before it is released:
+// the FAA keeps counting a finished request for a moment, and a request
+// started right after one finished was observed to get HTTP 429.
+const FAA_SLOT_RELEASE_DELAY_MICROSECONDS = 500000;
+// A single HTTP 429 (e.g. caused by that lag, or by other traffic from this
+// server) is retried once after this pause, while still holding the slot,
+// before it is treated as a real rate limit. Not done if the FAA asks for a
+// longer wait via Retry-After.
+const FAA_429_RETRY_WAIT_SECONDS = 1;
+const FAA_429_RETRY_MAX_RETRY_AFTER_SECONDS = 2;
 // Maximum radius; the FAA answers larger values with HTTP 400.
 const MAX_RADIUS_NM = 100;
 // The cached bearer token is renewed this long before it expires.
@@ -370,6 +380,7 @@ function getCachedOrFreshData(PDO $pdo, string $url): array
             recordFaaFailure($pdo, $failKey, $e);
             return serveStaleOrFail($pdo, $cached, $e->getMessage());
         } finally {
+            usleep(FAA_SLOT_RELEASE_DELAY_MICROSECONDS);
             releaseLock($pdo, $slot);
         }
 
@@ -400,23 +411,38 @@ function serveStaleOrFail(PDO $pdo, ?array $cached, string $reason): array
 }
 
 /**
- * Gets a bearer token and fetches the NOTAMs. If the FAA rejects the token
- * (HTTP 401) although it has not expired, the token is invalidated, renewed
- * and the fetch retried once. Throws FaaApiException on any FAA error.
+ * Gets a bearer token and fetches the NOTAMs. Two failures are retried once
+ * each: if the FAA rejects the token (HTTP 401) although it has not expired,
+ * the token is invalidated and renewed; a single HTTP 429 is retried after a
+ * short pause (see FAA_429_RETRY_WAIT_SECONDS). Throws FaaApiException on any
+ * other FAA error, or if a retry fails as well.
  */
 function fetchNotams(PDO $pdo, string $url): string
 {
     $token = getToken($pdo);
-    try {
-        return getNotamsFromFaa($url, $token);
-    } catch (FaaApiException $e) {
-        if ($e->statusCode !== 401) {
+    $renewedToken = false;
+    $retried429   = false;
+    while (true) {
+        try {
+            return getNotamsFromFaa($url, $token);
+        } catch (FaaApiException $e) {
+            if ($e->statusCode === 401 && !$renewedToken) {
+                $renewedToken = true;
+                error_log("notam.php: FAA rejected the bearer token (HTTP 401); renewing it once");
+                invalidateToken($pdo, $token);
+                $token = getToken($pdo);
+                continue;
+            }
+            if ($e->statusCode === 429 && !$retried429
+                && ($e->retryAfter === null || $e->retryAfter <= FAA_429_RETRY_MAX_RETRY_AFTER_SECONDS)) {
+                $retried429 = true;
+                $wait = max($e->retryAfter ?? 0, FAA_429_RETRY_WAIT_SECONDS);
+                error_log("notam.php: FAA answered HTTP 429; retrying once after $wait s");
+                sleep($wait);
+                continue;
+            }
             throw $e;
         }
-        error_log("notam.php: FAA rejected the bearer token (HTTP 401); renewing it once");
-        invalidateToken($pdo, $token);
-        $token = getToken($pdo);
-        return getNotamsFromFaa($url, $token);
     }
 }
 
