@@ -3,10 +3,11 @@
 -- Unlike metar.php and taf.php, notam.php does not create its tables. Run this
 -- file once when setting up a new database.
 --
--- notam_cache            Merged FAA responses under 'notam_<md5(url)>' and
---                        negative-cache rows under 'nfail_<md5(url)>' (value:
---                        FAA HTTP status). `expiration` is the end of
---                        freshness; old rows are deleted by performMaintenance().
+-- notam_cache            Merged FAA responses under 'notam_<md5(url)>',
+--                        negative-cache rows under 'nfail_<md5(url)>' and the
+--                        global cooldown row 'nfail_global' (value: FAA HTTP
+--                        status). `expiration` is the end of freshness; old
+--                        rows are deleted by performMaintenance().
 -- nms_token_cache        The current NMS bearer token: always one row, id = 1,
 --                        times in UTC.
 -- cache_metrics          Daily counts of 'hit', 'miss' and 'stale' responses.

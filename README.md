@@ -57,10 +57,10 @@ was served).
 Errors come with the JSON body `{"error": "<message>"}`.
 
 - `400`: invalid parameters; the message says which.
-- `503` with `Retry-After: 120`: the FAA failed and there is no cached
-  response for this query.
-- `500`: anything else (database, configuration, token). The message is
-  generic; details go to the server error log.
+- `503` with `Retry-After: 120`: the FAA (data or auth endpoint) failed or
+  is in a cooldown, and there is no cached response for this query.
+- `500`: anything else (database, configuration). The message is generic;
+  details go to the server error log.
 
 ### Caching and rate limiting
 
@@ -68,17 +68,35 @@ Errors come with the JSON body `{"error": "<message>"}`.
   `notam_<md5>`, where `<md5>` is the hash of the full upstream URL. Only
   requests with identical parameter strings share a cache entry.
 - A cached response is fresh for one hour; after that, the next request
-  fetches a new one. The old response is kept for 24 hours as a fallback.
+  fetches a new one. The old response is served as a fallback for up to
+  24 hours; older rows are ignored even before maintenance deletes them.
 - Only one process per query talks to the FAA (MySQL lock
   `notamlock_<md5>`). Concurrent requests for the same query wait for it, for
-  up to 20 s.
-- The FAA rate limit (HTTP 429) is shared by all clients of our account. If
-  an FAA request fails, a negative-cache row `nfail_<md5>` blocks further FAA
-  requests for that query for two minutes. During that time the last response
-  is served as `stale`, or `503` if there is none.
+  up to 20 s, then re-check the cache and the negative cache.
+- A fetch must finish within 30 s in total (all pages) and at most 50 pages
+  are read; otherwise it counts as an FAA failure. The current NMS API
+  answers everything on one page and ignores `pageNum`.
+- An FAA answer is only accepted if it has the NMS envelope
+  `{"status": "Success", "data": {"geojson": [...]}}` (an empty result has
+  no `geojson`). `"status": "Failure"`, a missing envelope or invalid JSON is
+  an FAA failure, so a broken answer never replaces a good cached one.
+- If an FAA request fails, a negative-cache row `nfail_<md5>` blocks further
+  FAA requests for that query for two minutes. During that time the last
+  response is served as `stale`, or `503` if there is none.
+- The FAA rate limit (HTTP 429) is shared by all clients of our account. A
+  429, or any failure to obtain a token, therefore also writes the row
+  `nfail_global`, which blocks FAA requests for *all* queries: for the time
+  in the FAA's `Retry-After` header if present (at most 10 minutes), else
+  two minutes.
 - The OAuth bearer token is cached in `nms_token_cache` (a single row with
-  `id = 1`, expiry in UTC) and renewed 60 s before it expires. Only one process
-  renews it (MySQL lock `nms_token`).
+  `id = 1`, expiry in UTC) and renewed 60 s before it expires. The token is
+  only fetched when the FAA actually has to be asked, never for cache hits.
+  Only one process renews it (MySQL lock `nms_token`); a process that waits
+  more than 20 s for the lock gives up (FAA failure, see above) rather than
+  renewing on its own. If the FAA rejects the cached token with HTTP 401, it
+  is discarded, renewed once and the request retried.
+- A successful FAA answer is returned to the client even if it cannot be
+  written to the cache (logged).
 
 ### Setup
 
@@ -92,9 +110,11 @@ Errors come with the JSON body `{"error": "<message>"}`.
 Every `hit`, `miss` and `stale` response is counted per day in the table
 `cache_metrics`. On about 1% of requests, notam.php also
 
-- rolls daily counts older than 30 days up into `cache_metrics_monthly`, and
+- rolls daily counts older than 30 days up into `cache_metrics_monthly`
+  (one transaction, so a failure cannot double count), and
 - deletes cached responses older than 24 hours and expired `nfail_` rows.
 
+Only one process runs maintenance at a time (MySQL lock `notam_maintenance`).
 Failures here are logged and never affect the response. Hit rate per day:
 
 ```sql
@@ -114,10 +134,16 @@ There is no test suite; testing is done with curl.
   environment variables must be set, and the database must be reachable.
 - `./testRunProxyDevelop.sh`: request against the develop instance at
   `https://enroute-data.akaflieg-freiburg.de/enrouteProxyDevelop/`.
-- `./get_token.sh`: fetch a bearer token from the FAA staging auth endpoint by
-  hand (uses `NMS_CLIENT_ID` and `NMS_CLIENT_SECRET`).
+- `./get_token.sh`: fetch a bearer token from the FAA auth endpoint by hand
+  (uses `NMS_AUTH_URL`, `NMS_CLIENT_ID` and `NMS_CLIENT_SECRET`).
 
 ## Notes on the FAA NMS feed (observed 2026-08)
+
+- The response envelope is `{"status": "Success", "data": {"geojson":
+  [...]}}`; errors are `{"status": "Failure", "message": "..."}` with an
+  HTTP 4xx/5xx. There are no pagination fields; `pageNum` and `pageSize` are
+  ignored and all matching NOTAMs come in one answer (about 700 kB for a
+  100 NM radius around Freiburg, observed 2026-10).
 
 - Response ordering is nondeterministic between identical requests.
 - Field names differ from the old FAA API: `affectedFir`, `minimumFl`,
@@ -134,5 +160,30 @@ There is no test suite; testing is done with curl.
   text (Q/A/B/C/D/E/F/G lines).
 - Swiss W-series NOTAMs were missing from NMS from 2026-08-19; reported to
   NOTAMS@faa.gov on 2026-08-21.
+
+## metar.php and taf.php
+
+Near-identical scripts (keep them in sync) that serve METARs and TAFs from
+the aviationweather.gov cache files for a bounding box:
+
+`metar.php?format=xml&bbox=minLat,minLon,maxLat,maxLon`
+
+The answer is XML in the shape of the aviationweather.gov schema, with the
+complete `<METAR>` / `<TAF>` elements of the upstream file (including nested
+elements such as TAF `<forecast>` periods).
+
+- The whole upstream file is downloaded, validated and stored per station in
+  the table `metar_cache` / `taf_cache` (auto-created, InnoDB). The data is
+  refreshed when it is older than 5 minutes; only one process refreshes
+  (MySQL lock), the others keep serving the existing data.
+- A download that is not the expected `<response><data>` document with at
+  least one usable record is rejected and the existing data kept. After a
+  failed refresh, no new attempt is made for 60 s. The refresh times are kept
+  in `metar_cache_state` / `taf_cache_state` (computed in SQL, so the time
+  zones of PHP and MySQL do not matter).
+- Errors come as `<response><errors><error>…</error></errors></response>`:
+  `400` for invalid parameters, `503` (with `Retry-After: 60`) if there is no
+  dataset at all yet, `500` for anything else. A legitimately empty bounding
+  box is a `200` with `num_results="0"`.
 
 The scripts in this directory were kindly donated by Markus Sachs.

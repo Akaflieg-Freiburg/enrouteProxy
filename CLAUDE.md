@@ -8,8 +8,8 @@ Proxy scripts for **Enroute Flight Navigation**. They run on the Akaflieg Freibu
 
 ## Endpoints
 
-- **metar.php** and **taf.php** — near-identical twins (keep them in sync when changing one). They download the full aviationweather.gov cache file (`metars.cache.xml.gz` / `tafs.cache.xml.gz`), store per-station rows in MySQL, and answer bounding-box queries (`?format=xml&bbox=minLat,minLon,maxLat,maxLon`) with XML matching the aviationweather.gov schema. Cache TTL is 5 minutes; tables are auto-created.
-- **notam.php** — proxies the FAA NOTAM Management Service (NMS) API: OAuth bearer token cached in `nms_token_cache`, paginated `NMS_API_BASE/notams` queries merged into one geojson response, cached in `notam_cache` with a stale fallback, a negative cache and a per-query `GET_LOCK` to protect the FAA rate limit (HTTP 429, shared by all clients). Request/response format, error codes, caching and metrics are documented in README.md (keep it in sync when changing behaviour); the schema is in notam.sql, since unlike metar/taf the tables are *not* auto-created.
+- **metar.php** and **taf.php** — near-identical twins (keep them in sync when changing one). They download the full aviationweather.gov cache file (`metars.cache.xml.gz` / `tafs.cache.xml.gz`), store per-station rows in MySQL, and answer bounding-box queries (`?format=xml&bbox=minLat,minLon,maxLat,maxLon`) with XML matching the aviationweather.gov schema (stored `asXML()` strings are spliced into the output verbatim). Cache TTL is 5 minutes with a 60 s backoff after failed refreshes, tracked in `*_cache_state`; tables are auto-created.
+- **notam.php** — proxies the FAA NOTAM Management Service (NMS) API: OAuth bearer token cached in `nms_token_cache`, `NMS_API_BASE/notams` queries (validated envelope, pages merged into one geojson response), cached in `notam_cache` with a stale fallback (max 24 h), a per-query negative cache, a global cooldown row `nfail_global` after HTTP 429 or token failures, and a per-query `GET_LOCK` to protect the FAA rate limit (HTTP 429, shared by all clients). The token is only fetched when the FAA must actually be asked. Request/response format, error codes, caching and metrics are documented in README.md (keep it in sync when changing behaviour); the schema is in notam.sql, since unlike metar/taf the tables are *not* auto-created.
 
 All three share the MySQL database `enroutecaches` on host `sql731.your-server.de` (hardcoded).
 
@@ -30,7 +30,7 @@ php -S localhost:8000
 ./testRunLocal.sh            # NOTAM request against localhost:8000
 
 ./testRunProxyDevelop.sh     # NOTAM request against the deployed develop instance
-./get_token.sh               # Fetch an FAA staging bearer token manually (uses NMS_CLIENT_ID/SECRET)
+./get_token.sh               # Fetch an FAA bearer token manually (uses NMS_AUTH_URL, NMS_CLIENT_ID/SECRET)
 ```
 
 Note that local runs still need reachable MySQL credentials, since every endpoint touches the cache database.
